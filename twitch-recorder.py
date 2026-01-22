@@ -318,16 +318,29 @@ class TwitchRecorder:
             logging.error(f"Error processing file {recorded_filename}: {e}")
 
     def ffmpeg_copy_and_fix_errors(self, recorded_filename, processed_filename):
-        """Run ffmpeg with proper error handling"""
+        """Run ffmpeg with H.264 compression and higher audio bitrate."""
         try:
+            # Use fast copy for audio (avoid re-encoding issues) and moderate H.264 settings for Pi
             result = subprocess.run([
-                self.ffmpeg_path, "-err_detect", "ignore_err", "-i", recorded_filename, 
-                "-c", "copy", processed_filename, "-y"
-            ], capture_output=True, text=True, timeout=3600)  # 1 hour timeout
-            
+                self.ffmpeg_path, 
+                "-err_detect", "ignore_err",
+                "-i", recorded_filename,
+                "-c:v", "libx264",           # H.264 codec for efficient compression
+                "-crf", "28",                # Slightly lower quality (28 instead of 23) for speed on Pi
+                "-preset", "medium",         # Medium preset (faster than slower for Raspberry Pi)
+                "-c:a", "aac",               # Re-encode audio to AAC
+                "-b:a", "128k",              # Reduced audio bitrate (DJ quality at 128k is sufficient)
+                "-movflags", "+faststart",   # Optimize for streaming
+                "-y",                        # Overwrite output file
+                processed_filename
+            ], capture_output=True, text=True, timeout=86400)
+
             if result.returncode != 0:
-                logging.error(f"FFmpeg failed: {result.stderr}")
+                logging.error(f"FFmpeg failed for {recorded_filename}")
+                logging.error(f"FFmpeg stderr: {result.stderr}")
+                logging.error(f"FFmpeg stdout: {result.stdout}")
                 return False
+            logging.info(f"Successfully processed: {recorded_filename}")
             return True
         except subprocess.TimeoutExpired:
             logging.error(f"FFmpeg timeout processing {recorded_filename}")
