@@ -93,6 +93,7 @@ echo ""; echo -e "${BOLD}${BLUE}════════════════
 
 LOOP=0; CHANNELS=$(get_channels)
 PREV_TOTAL=0; PREV_IDLE=0
+DANCE_FRAME=0
 
 while true; do
     SECOND=$(date +%s)
@@ -107,16 +108,42 @@ while true; do
     
     [ $COUNT -gt 0 ] && { ICON=$([[ $((SECOND % 2)) -eq 0 ]] && echo "🔴" || echo "⚫"); wl 7 "  Streams:  ${GREEN}${ICON} ${COUNT} LIVE${NC}"; } || wl 7 "  Streams:  ${YELLOW}○ IDLE${NC}"
     
-    # Dancing ASCII when recording!
+    # FFmpeg processing status
+    FFMPEG_PIDS=($(pgrep -f "ffmpeg" 2>/dev/null)); FFMPEG_COUNT=${#FFMPEG_PIDS[@]}
+    if [ $FFMPEG_COUNT -gt 0 ]; then
+        # Try to get what file is being processed
+        FFMPEG_INFO=$(ps -p ${FFMPEG_PIDS[0]} -o args= 2>/dev/null | grep -oP '(?<=-i ")[^"]+|(?<=-i )[^ ]+' | head -1 | xargs basename 2>/dev/null)
+        [ -z "$FFMPEG_INFO" ] && FFMPEG_INFO="processing..."
+        FFMPEG_INFO="${FFMPEG_INFO:0:25}"
+        PROC_ICON=$([[ $((SECOND % 2)) -eq 0 ]] && echo "⚙️" || echo "🔧")
+        wl 8 "  FFmpeg:   ${CYAN}${PROC_ICON} ${FFMPEG_COUNT} ENCODING${NC} ${FFMPEG_INFO}"
+    else
+        wl 8 "  FFmpeg:   ${YELLOW}○ IDLE${NC}                              "
+    fi
+    
+    # Dancing ASCII when recording! (smooth 12-frame animation)
     if [ $COUNT -gt 0 ]; then
-        FRAME=$((LOOP % 6))
+        FRAME=$((DANCE_FRAME % 12))
+        DANCE_FRAME=$((DANCE_FRAME + 1))
         case $FRAME in
-            0) D1="  o   "; D2=" /|\\  "; D3=" / \\  ";;
-            1) D1=" \\o   "; D2="  |\\  "; D3=" / \\  ";;
-            2) D1="  o/  "; D2=" /|   "; D3=" / \\  ";;
-            3) D1=" \\o/  "; D2="  |   "; D3=" / \\  ";;
-            4) D1="  o   "; D2=" /|\\  "; D3="  |   ";;
-            5) D1=" \\o/  "; D2="  |   "; D3=" /|\\  ";;
+            # Groove left
+            0)  D1="  o   "; D2=" /|\\  "; D3=" / \\  ";;
+            1)  D1=" \\o   "; D2=" /|\\  "; D3=" / \\  ";;
+            2)  D1=" \\o   "; D2="  |\\  "; D3=" / \\  ";;
+            # Arms up left
+            3)  D1=" \\o/  "; D2="  |\\  "; D3=" / \\  ";;
+            4)  D1=" \\o/  "; D2="  |   "; D3=" / \\  ";;
+            # Transition right
+            5)  D1="  o/  "; D2="  |   "; D3=" / \\  ";;
+            # Groove right
+            6)  D1="  o/  "; D2=" /|   "; D3=" / \\  ";;
+            7)  D1="  o/  "; D2=" /|\\  "; D3=" / \\  ";;
+            # Arms up right
+            8)  D1=" \\o/  "; D2=" /|   "; D3=" / \\  ";;
+            9)  D1=" \\o/  "; D2="  |   "; D3=" / \\  ";;
+            # Back to center
+            10) D1="  o/  "; D2=" /|   "; D3=" / \\  ";;
+            11) D1=" \\o   "; D2=" /|\\  "; D3=" / \\  ";;
         esac
         tput cup 6 52; printf "${MAGENTA}%s${NC}" "$D1"
         tput cup 7 52; printf "${MAGENTA}%s${NC}" "$D2"
@@ -174,7 +201,7 @@ while true; do
     # Memory from /proc/meminfo
     MEM_INFO=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{printf "%.0f", 100*(t-a)/t}' /proc/meminfo)
     
-    # Service CPU & Memory
+    # Service CPU & Memory (recorder + streamlink + ffmpeg)
     SVC_CPU=0; SVC_MEM=0
     REC_PID=$(pgrep -f "twitch-recorder.py" | head -1)
     if [ -n "$REC_PID" ]; then
@@ -186,6 +213,11 @@ while true; do
         read PC PM <<< $(ps -p $PID -o %cpu=,%mem= 2>/dev/null)
         SVC_CPU=$(awk "BEGIN{print $SVC_CPU+${PC:-0}}")
         SVC_MEM=$(awk "BEGIN{print $SVC_MEM+${PM:-0}}")
+    done
+    for PID in "${FFMPEG_PIDS[@]}"; do
+        read FC FM <<< $(ps -p $PID -o %cpu=,%mem= 2>/dev/null)
+        SVC_CPU=$(awk "BEGIN{print $SVC_CPU+${FC:-0}}")
+        SVC_MEM=$(awk "BEGIN{print $SVC_MEM+${FM:-0}}")
     done
     
     wl 22 "  Disk: ${DISK:-N/A} | Temp: ${TEMP:-N/A}°C | Up: ${UP}"
@@ -207,6 +239,6 @@ while true; do
     fi
     
     SPIN=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
-    wl 32 "Updated: $(date '+%H:%M:%S') ${CYAN}${SPIN[$((SECOND % 10))]}${NC} | Ctrl+C to exit"
-    LOOP=$((LOOP + 1)); sleep 1
+    wl 32 "Updated: $(date '+%H:%M:%S') ${CYAN}${SPIN[$((LOOP % 10))]}${NC} | Ctrl+C to exit"
+    LOOP=$((LOOP + 1)); sleep 0.3
 done
