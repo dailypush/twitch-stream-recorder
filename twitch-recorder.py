@@ -30,7 +30,7 @@ class TwitchRecorder:
     def __init__(self):
         # Load configuration with error handling
         try:
-            with open("config.json", "r") as config_file:
+            with open("config/config.json", "r") as config_file:
                 config_data = json.load(config_file)
         except FileNotFoundError:
             logging.error("config.json not found. Please create a configuration file.")

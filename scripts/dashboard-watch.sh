@@ -17,4 +17,5 @@ echo "Starting dashboard in watch mode (refreshing every ${INTERVAL}s)"
 echo "Press Ctrl+C to exit"
 echo ""
 
-watch -n "$INTERVAL" "$HOME/twitch-recoder/recorder-dashboard.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+watch -n "$INTERVAL" "$SCRIPT_DIR/dashboard.sh"

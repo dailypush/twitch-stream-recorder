@@ -12,11 +12,12 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-SERVICE_FILE="/home/pi/twitch-recoder/twitch-stream-recorder/twitch-recorder.service"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVICE_FILE="$SCRIPT_DIR/twitch-recorder.service"
 
 if [ ! -f "$SERVICE_FILE" ]; then
     echo "ERROR: Service file not found at $SERVICE_FILE"
-    echo "Make sure the file is in the twitch-stream-recorder directory"
+    echo "Make sure the file is in the systemd directory"
     exit 1
 fi
 

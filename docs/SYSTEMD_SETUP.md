@@ -4,9 +4,17 @@ This sets up the twitch-recorder to automatically start on boot and restart if i
 
 ## Installation
 
-### 1. Copy the service file to systemd
+### Option A: Use the install script
 ```bash
-sudo cp ~/twitch-recoder/twitch-stream-recorder/twitch-recorder.service /etc/systemd/system/
+cd ~/twitch-stream-recorder/systemd
+sudo bash install.sh
+```
+
+### Option B: Manual installation
+
+#### 1. Copy the service file to systemd
+```bash
+sudo cp ~/twitch-stream-recorder/systemd/twitch-recorder.service /etc/systemd/system/
 ```
 
 ### 2. Reload systemd daemon
