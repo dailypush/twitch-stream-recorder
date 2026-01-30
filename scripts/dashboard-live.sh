@@ -13,7 +13,45 @@ CONFIG_FILE="$RECORDER_DIR/config.json"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+MAGENTA='\033[0;35m'
 WIDTH=65
+
+# Dancing ASCII frames for when recording is live
+DANCER=(
+'  o   '
+' /|\\ '
+' / \\ '
+)
+DANCER1=(
+'  o   '
+' /|\\ '
+' / \\ '
+)
+DANCER2=(
+' \\o  '
+'  |\\ '
+' / \\ '
+)
+DANCER3=(
+'  o/ '
+' /|  '
+' / \\ '
+)
+DANCER4=(
+' \\o/ '
+'  |  '
+' / \\ '
+)
+DANCER5=(
+'  o  '
+' /|\\ '
+'  |  '
+)
+DANCER6=(
+' \\o/ '
+'  |  '
+' /|\\ '
+)
 
 trap "tput cnorm; clear; exit" INT TERM EXIT
 tput civis
@@ -68,6 +106,26 @@ while true; do
     done
     
     [ $COUNT -gt 0 ] && { ICON=$([[ $((SECOND % 2)) -eq 0 ]] && echo "🔴" || echo "⚫"); wl 7 "  Streams:  ${GREEN}${ICON} ${COUNT} LIVE${NC}"; } || wl 7 "  Streams:  ${YELLOW}○ IDLE${NC}"
+    
+    # Dancing ASCII when recording!
+    if [ $COUNT -gt 0 ]; then
+        FRAME=$((LOOP % 6))
+        case $FRAME in
+            0) D1="  o   "; D2=" /|\\  "; D3=" / \\  ";;
+            1) D1=" \\o   "; D2="  |\\  "; D3=" / \\  ";;
+            2) D1="  o/  "; D2=" /|   "; D3=" / \\  ";;
+            3) D1=" \\o/  "; D2="  |   "; D3=" / \\  ";;
+            4) D1="  o   "; D2=" /|\\  "; D3="  |   ";;
+            5) D1=" \\o/  "; D2="  |   "; D3=" /|\\  ";;
+        esac
+        tput cup 6 52; printf "${MAGENTA}%s${NC}" "$D1"
+        tput cup 7 52; printf "${MAGENTA}%s${NC}" "$D2"
+        tput cup 8 52; printf "${MAGENTA}%s${NC}" "$D3"
+    else
+        tput cup 6 52; printf "      "
+        tput cup 7 52; printf "      "
+        tput cup 8 52; printf "      "
+    fi
     
     for i in 0 1 2; do
         ROW=$((10 + i))
