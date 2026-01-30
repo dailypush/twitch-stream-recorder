@@ -108,17 +108,48 @@ while true; do
     
     [ $COUNT -gt 0 ] && { ICON=$([[ $((SECOND % 2)) -eq 0 ]] && echo "🔴" || echo "⚫"); wl 7 "  Streams:  ${GREEN}${ICON} ${COUNT} LIVE${NC}"; } || wl 7 "  Streams:  ${YELLOW}○ IDLE${NC}"
     
-    # FFmpeg processing status
+    # FFmpeg processing status with progress
     FFMPEG_PIDS=($(pgrep -f "ffmpeg" 2>/dev/null)); FFMPEG_COUNT=${#FFMPEG_PIDS[@]}
     if [ $FFMPEG_COUNT -gt 0 ]; then
-        # Try to get what file is being processed
-        FFMPEG_INFO=$(ps -p ${FFMPEG_PIDS[0]} -o args= 2>/dev/null | grep -oP '(?<=-i ")[^"]+|(?<=-i )[^ ]+' | head -1 | xargs basename 2>/dev/null)
-        [ -z "$FFMPEG_INFO" ] && FFMPEG_INFO="processing..."
-        FFMPEG_INFO="${FFMPEG_INFO:0:25}"
+        FFPID=${FFMPEG_PIDS[0]}
+        FFARGS=$(ps -p $FFPID -o args= 2>/dev/null)
+        # Get ffmpeg working directory for relative paths
+        FFCWD=$(readlink /proc/$FFPID/cwd 2>/dev/null)
+        
+        # Extract input file: everything between "-i " and " -c:v" (handles spaces in filenames)
+        INPUT_REL=$(echo "$FFARGS" | sed -n 's/.*-i \(.*\) -c:v.*/\1/p')
+        # Extract output file: everything after "-y "
+        OUTPUT_REL=$(echo "$FFARGS" | sed -n 's/.*-y \(.*\)/\1/p')
+        
+        # Convert relative paths to absolute
+        [[ "$INPUT_REL" == ./* ]] && INPUT_FILE="$FFCWD/${INPUT_REL:2}" || INPUT_FILE="$INPUT_REL"
+        [[ "$OUTPUT_REL" == ./* ]] && OUTPUT_FILE="$FFCWD/${OUTPUT_REL:2}" || OUTPUT_FILE="$OUTPUT_REL"
+        
+        PROGRESS=""
+        if [ -n "$INPUT_FILE" ] && [ -n "$OUTPUT_FILE" ] && [ -f "$INPUT_FILE" ] && [ -f "$OUTPUT_FILE" ]; then
+            IN_SIZE=$(stat -c%s "$INPUT_FILE" 2>/dev/null)
+            OUT_SIZE=$(stat -c%s "$OUTPUT_FILE" 2>/dev/null)
+            if [ -n "$IN_SIZE" ] && [ "$IN_SIZE" -gt 0 ] && [ -n "$OUT_SIZE" ]; then
+                # Estimate progress: assume output ~35% of input size when done
+                PCT=$(awk "BEGIN{p=int(100*$OUT_SIZE/($IN_SIZE*0.35)); if(p>99)p=99; print p}")
+                IN_H=$(numfmt --to=iec $IN_SIZE 2>/dev/null || echo "${IN_SIZE}B")
+                OUT_H=$(numfmt --to=iec $OUT_SIZE 2>/dev/null || echo "${OUT_SIZE}B")
+                # Progress bar (ASCII-safe characters)
+                FILLED=$((PCT / 10))
+                BAR=$(printf '%*s' $FILLED '' | tr ' ' '#')$(printf '%*s' $((10-FILLED)) '' | tr ' ' '-')
+                PROGRESS="[${BAR}] ${PCT}% (${OUT_H}/${IN_H})"
+            fi
+        fi
+        
+        # Fallback: show filename if no progress
+        if [ -z "$PROGRESS" ]; then
+            FNAME=$(basename "$INPUT_FILE" 2>/dev/null | cut -c1-30)
+            [ -n "$FNAME" ] && PROGRESS="$FNAME" || PROGRESS="encoding..."
+        fi
         PROC_ICON=$([[ $((SECOND % 2)) -eq 0 ]] && echo "⚙️" || echo "🔧")
-        wl 8 "  FFmpeg:   ${CYAN}${PROC_ICON} ${FFMPEG_COUNT} ENCODING${NC} ${FFMPEG_INFO}"
+        wl 8 "  FFmpeg:   ${CYAN}${PROC_ICON}${NC} ${PROGRESS}"
     else
-        wl 8 "  FFmpeg:   ${YELLOW}○ IDLE${NC}                              "
+        wl 8 "  FFmpeg:   ${YELLOW}○ IDLE${NC}                                        "
     fi
     
     # Dancing ASCII when recording! (smooth 12-frame animation)
