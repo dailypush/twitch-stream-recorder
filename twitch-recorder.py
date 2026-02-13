@@ -30,7 +30,9 @@ class TwitchRecorder:
     def __init__(self):
         # Load configuration with error handling
         try:
-            with open("config/config.json", "r") as config_file:
+            # Try config/config.json first, fall back to config.json
+            config_path = "config/config.json" if os.path.exists("config/config.json") else "config.json"
+            with open(config_path, "r") as config_file:
                 config_data = json.load(config_file)
         except FileNotFoundError:
             logging.error("config.json not found. Please create a configuration file.")
@@ -171,10 +173,10 @@ class TwitchRecorder:
         """Main run loop with proper threading"""
         paths = self.create_directories()
         
-        # Process any existing recordings first
+        # Don't process old recordings at startup - do it during idle time
+        # Just prune old files
         for username in self.usernames:
             recorded_path, processed_path = paths[username]
-            self.process_previous_recordings(recorded_path, processed_path)
             self.prune_old_files(recorded_path)
             self.prune_old_files(processed_path)
 
@@ -198,6 +200,12 @@ class TwitchRecorder:
                             future.result()
                         except Exception as e:
                             logging.error(f"Error in thread for {username}: {e}")
+                    
+                    # Process old recordings ONLY when idle (no active recordings)
+                    if self._active_recordings == 0 and not self.disable_ffmpeg:
+                        for username in self.usernames:
+                            recorded_path, processed_path = paths[username]
+                            self.process_previous_recordings(recorded_path, processed_path)
                 else:
                     logging.warning(f"High CPU usage ({cpu_usage}%). Pausing new checks.")
                 
@@ -270,17 +278,17 @@ class TwitchRecorder:
             logging.error(f"Error during pruning in {path}: {e}")
 
     def process_previous_recordings(self, recorded_path, processed_path):
-        """Process any existing recordings"""
+        """Process ONE existing recording per call (called during idle time only)"""
         try:
             video_files = [f for f in os.listdir(recorded_path) 
                           if os.path.isfile(os.path.join(recorded_path, f)) and f.endswith('.mp4')]
             
+            # Only process ONE file at a time to avoid blocking for too long
             if video_files:
-                logging.info(f"Processing {len(video_files)} previous recordings")
-                
-            for filename in video_files:
+                filename = video_files[0]  # Just process the first one
                 recorded_filename = os.path.join(recorded_path, filename)
                 processed_filename = os.path.join(processed_path, filename)
+                logging.info(f"Processing {filename} ({len(video_files)-1} remaining)")
                 self.process_recorded_file(recorded_filename, processed_filename)
         except Exception as e:
             logging.error(f"Error processing previous recordings: {e}")
@@ -304,6 +312,11 @@ class TwitchRecorder:
                 logging.info(f"Moving: {recorded_filename}")
                 shutil.move(recorded_filename, processed_filename)
             else:
+                # Double check we're still idle before starting ffmpeg
+                if self._active_recordings > 0:
+                    logging.info(f"Stream recording started, postponing ffmpeg processing")
+                    return
+                    
                 logging.info(f"Processing with ffmpeg: {recorded_filename}")
                 if self.ffmpeg_copy_and_fix_errors(recorded_filename, processed_filename):
                     os.remove(recorded_filename)
@@ -320,6 +333,10 @@ class TwitchRecorder:
     def ffmpeg_copy_and_fix_errors(self, recorded_filename, processed_filename):
         """Run ffmpeg with H.264 compression and higher audio bitrate."""
         try:
+            # Calculate reasonable timeout based on file size (1 hour per GB on slow devices)
+            file_size_gb = os.path.getsize(recorded_filename) / (1024**3)
+            timeout_seconds = max(3600, int(file_size_gb * 3600))  # At least 1 hour, scale with file size
+            
             # Use fast copy for audio (avoid re-encoding issues) and moderate H.264 settings for Pi
             result = subprocess.run([
                 self.ffmpeg_path, 
@@ -333,7 +350,7 @@ class TwitchRecorder:
                 "-movflags", "+faststart",   # Optimize for streaming
                 "-y",                        # Overwrite output file
                 processed_filename
-            ], capture_output=True, text=True, timeout=86400)
+            ], capture_output=True, text=True, timeout=timeout_seconds)
 
             if result.returncode != 0:
                 logging.error(f"FFmpeg failed for {recorded_filename}")
@@ -343,7 +360,7 @@ class TwitchRecorder:
             logging.info(f"Successfully processed: {recorded_filename}")
             return True
         except subprocess.TimeoutExpired:
-            logging.error(f"FFmpeg timeout processing {recorded_filename}")
+            logging.error(f"FFmpeg timeout ({timeout_seconds}s) processing {recorded_filename}")
             return False
         except Exception as e:
             logging.error(f"FFmpeg error: {e}")
@@ -444,10 +461,9 @@ class TwitchRecorder:
             with self._active_recordings_lock:
                 self._recording_processes.pop(username, None)
 
-            # Process the recording if it exists and has content
+            # Don't process immediately - let it happen during idle time in main loop
             if os.path.exists(recorded_filename) and os.path.getsize(recorded_filename) > 0:
-                logging.info(f"Recording completed for {username}, processing...")
-                self.process_recorded_file(recorded_filename, processed_filename)
+                logging.info(f"Recording completed for {username}, will process when idle")
             else:
                 logging.warning(f"Recording file for {username} not found or empty")
 

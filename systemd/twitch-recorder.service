@@ -18,8 +18,8 @@ SyslogIdentifier=twitch-recorder
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/home/pi/twitch-recoder/twitch-stream-recorder/recording /home/pi/twitch-recoder/twitch-stream-recorder/logs
+ProtectHome=read-only
+ReadWritePaths=/home/pi/twitch-recoder/twitch-stream-recorder/recording /home/pi/twitch-recoder/twitch-stream-recorder/logs /home/pi/twitch-recoder/twitch-stream-recorder
 
 # Resource limits
 MemoryLimit=512M
