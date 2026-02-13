@@ -3,9 +3,13 @@
 # Twitch Recorder Dashboard - Enhanced Version with Animation
 # Run: ~/twitch-recoder/recorder-dashboard.sh
 
-RECORDER_DIR="$HOME/twitch-recoder/twitch-stream-recorder"
-LOG_FILE="$RECORDER_DIR/twitch-recorder.log"
-RECORDING_DIR="$RECORDER_DIR/recording/recorded"
+# Load shared configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/config.sh"
+
+RECORDER_DIR="$TWITCH_RECORDER_DIR"
+LOG_FILE="$TWITCH_RECORDER_MAIN_LOG"
+RECORDING_DIR="$TWITCH_RECORDER_RECORDED"
 
 # Colors
 RED='\033[0;31m'

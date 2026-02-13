@@ -12,7 +12,7 @@ import psutil
 import json
 import threading
 import signal
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from tqdm import tqdm
 from pathlib import Path
 from colorama import init, Fore, Style
@@ -58,7 +58,10 @@ class TwitchRecorder:
         self._active_recordings_lock = threading.Lock()
         self._active_recordings = 0
         self._recording_processes = {}  # Track active processes
+        self._recording_processes_lock = threading.Lock()  # Separate lock for processes dict
         self._shutdown_event = threading.Event()
+        self._executor = None  # Store executor reference for cleanup
+        self._token_refresh_lock = threading.Lock()  # Lock for token refresh
 
         # User configuration
         self.prune_after_days = config_data.get("prune_after_days", 30)
@@ -88,25 +91,66 @@ class TwitchRecorder:
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+        
+        # Validate dependencies
+        self._validate_dependencies()
+
+    def _validate_dependencies(self):
+        """Validate required external dependencies"""
+        # Check streamlink
+        try:
+            result = subprocess.run(['streamlink', '--version'], capture_output=True, timeout=5)
+            if result.returncode != 0:
+                logging.warning("Streamlink not found or not working properly")
+        except FileNotFoundError:
+            logging.error("Streamlink is not installed. Please install: pip install streamlink")
+            sys.exit(1)
+        except Exception as e:
+            logging.warning(f"Could not verify streamlink: {e}")
+        
+        # Check ffmpeg if enabled
+        if not self.disable_ffmpeg:
+            try:
+                result = subprocess.run([self.ffmpeg_path, '-version'], capture_output=True, timeout=5)
+                if result.returncode != 0:
+                    logging.warning(f"FFmpeg not found at {self.ffmpeg_path}")
+                    logging.warning("Processing will be disabled")
+                    self.disable_ffmpeg = True
+            except FileNotFoundError:
+                logging.error(f"FFmpeg not found at {self.ffmpeg_path}")
+                logging.warning("Processing will be disabled")
+                self.disable_ffmpeg = True
+            except Exception as e:
+                logging.warning(f"Could not verify ffmpeg: {e}")
 
     def _signal_handler(self, signum, frame):
-        logging.info("Shutdown signal received. Cleaning up...")
+        """Handle shutdown signals safely"""
+        signal_name = signal.Signals(signum).name
+        logging.info(f"Shutdown signal received: {signal_name}. Cleaning up...")
         self._shutdown_event.set()
-        self._cleanup_processes()
+        
+        # Don't call cleanup here - let the main loop handle it
+        # This avoids race conditions with the main thread
 
     def _cleanup_processes(self):
         """Clean up any running recording processes"""
-        with self._active_recordings_lock:
-            for username, process in self._recording_processes.items():
-                if process and process.poll() is None:
-                    logging.info(f"Terminating recording process for {username}")
-                    try:
-                        process.terminate()
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                    except Exception as e:
-                        logging.error(f"Error terminating process for {username}: {e}")
+        with self._recording_processes_lock:
+            processes_to_cleanup = list(self._recording_processes.items())
+            
+        for username, process in processes_to_cleanup:
+            if process and process.poll() is None:
+                logging.info(f"Terminating recording process for {username}")
+                try:
+                    process.terminate()
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    logging.warning(f"Force killing process for {username}")
+                    process.kill()
+                    process.wait()
+                except Exception as e:
+                    logging.error(f"Error terminating process for {username}: {e}")
+        
+        with self._recording_processes_lock:
             self._recording_processes.clear()
 
     @property
@@ -147,24 +191,31 @@ class TwitchRecorder:
         return True
 
     def fetch_access_token(self):
-        """Fetch or refresh access token with proper error handling"""
+        """Fetch or refresh access token with proper error handling and thread safety"""
         try:
             current_time = time.time()
             # Refresh token if it expires in the next 5 minutes
             if self.access_token and current_time < (self.token_expires_at - 300):
                 return self.access_token
 
-            logging.info("Fetching new access token")
-            token_response = requests.post(self.token_url, timeout=15)
-            token_response.raise_for_status()
-            token_data = token_response.json()
-            
-            self.access_token = token_data["access_token"]
-            expires_in = token_data.get("expires_in", 3600)
-            self.token_expires_at = current_time + expires_in
-            
-            logging.info(f"Access token refreshed, expires in {expires_in} seconds")
-            return self.access_token
+            # Use lock to prevent multiple threads from refreshing simultaneously
+            with self._token_refresh_lock:
+                # Double-check after acquiring lock (another thread may have refreshed)
+                current_time = time.time()
+                if self.access_token and current_time < (self.token_expires_at - 300):
+                    return self.access_token
+                    
+                logging.info("Fetching new access token")
+                token_response = requests.post(self.token_url, timeout=15)
+                token_response.raise_for_status()
+                token_data = token_response.json()
+                
+                self.access_token = token_data["access_token"]
+                expires_in = token_data.get("expires_in", 3600)
+                self.token_expires_at = current_time + expires_in
+                
+                logging.info(f"Access token refreshed, expires in {expires_in} seconds")
+                return self.access_token
         except Exception as e:
             logging.error(f"Failed to fetch access token: {e}")
             raise
@@ -181,7 +232,8 @@ class TwitchRecorder:
             self.prune_old_files(processed_path)
 
         # Use ThreadPoolExecutor for concurrent recording checks
-        with ThreadPoolExecutor(max_workers=min(len(self.usernames), 5)) as executor:
+        self._executor = ThreadPoolExecutor(max_workers=min(len(self.usernames), 5))
+        try:
             while not self._shutdown_event.is_set():
                 cpu_usage = psutil.cpu_percent(interval=1)
                 
@@ -190,16 +242,33 @@ class TwitchRecorder:
                     future_to_username = {}
                     for username in self.usernames:
                         recorded_path, processed_path = paths[username]
-                        future = executor.submit(self.check_and_record_user, username, recorded_path, processed_path)
+                        future = self._executor.submit(self.check_and_record_user, username, recorded_path, processed_path)
                         future_to_username[future] = username
                     
-                    # Wait for all tasks to complete or timeout
-                    for future in as_completed(future_to_username, timeout=self.refresh):
-                        username = future_to_username[future]
-                        try:
-                            future.result()
-                        except Exception as e:
-                            logging.error(f"Error in thread for {username}: {e}")
+                    # Wait for all tasks to complete with proper timeout handling
+                    completed_futures = set()
+                    try:
+                        for future in as_completed(future_to_username, timeout=self.refresh):
+                            username = future_to_username[future]
+                            completed_futures.add(future)
+                            try:
+                                future.result()
+                            except Exception as e:
+                                logging.error(f"Error in thread for {username}: {e}")
+                    except TimeoutError:
+                        # Handle futures that didn't complete in time
+                        incomplete = set(future_to_username.keys()) - completed_futures
+                        for future in incomplete:
+                            username = future_to_username[future]
+                            logging.warning(f"Task for {username} did not complete in time")
+                            future.cancel()  # Attempt to cancel
+                    except FuturesTimeoutError:
+                        # Handle futures that didn't complete in time  
+                        incomplete = set(future_to_username.keys()) - completed_futures
+                        for future in incomplete:
+                            username = future_to_username[future]
+                            logging.warning(f"Task for {username} timed out")
+                            future.cancel()
                     
                     # Process old recordings ONLY when idle (no active recordings)
                     if self._active_recordings == 0 and not self.disable_ffmpeg:
@@ -214,9 +283,14 @@ class TwitchRecorder:
                     continue
                 else:
                     break
-
-        logging.info("Shutting down...")
-        self._cleanup_processes()
+        finally:
+            # Graceful shutdown of executor
+            logging.info("Shutting down executor...")
+            if self._executor:
+                # Python 3.7 compatible shutdown (cancel_futures added in 3.9)
+                self._executor.shutdown(wait=False)
+            logging.info("Cleaning up processes...")
+            self._cleanup_processes()  # This already handles process termination properly
 
     def check_and_record_user(self, username, recorded_path, processed_path):
         """Check and potentially record a single user"""
@@ -297,15 +371,26 @@ class TwitchRecorder:
         """Process a single recorded file with proper error handling"""
         try:
             # Wait a moment to ensure file is not being written to
-            time.sleep(2)
+            time.sleep(3)
             
-            # Check if file is still being written (size changing)
-            initial_size = os.path.getsize(recorded_filename)
-            time.sleep(1)
-            final_size = os.path.getsize(recorded_filename)
+            # Check if file is still being written (multiple size checks)
+            sizes = []
+            for i in range(3):
+                sizes.append(os.path.getsize(recorded_filename))
+                if i < 2:  # Don't sleep after last check
+                    time.sleep(2)
             
-            if initial_size != final_size:
-                logging.warning(f"File {recorded_filename} still being written, skipping")
+            # If file size is still changing, it's being written to
+            if len(set(sizes)) > 1:
+                logging.warning(f"File {recorded_filename} still being written (sizes: {sizes}), skipping")
+                return
+            
+            # Additional check: ensure file isn't locked by another process
+            try:
+                with open(recorded_filename, 'rb') as f:
+                    pass  # Just try to open, don't read
+            except IOError as e:
+                logging.warning(f"File {recorded_filename} is locked or inaccessible: {e}")
                 return
             
             if self.disable_ffmpeg:
@@ -319,7 +404,11 @@ class TwitchRecorder:
                     
                 logging.info(f"Processing with ffmpeg: {recorded_filename}")
                 if self.ffmpeg_copy_and_fix_errors(recorded_filename, processed_filename):
-                    os.remove(recorded_filename)
+                    try:
+                        os.remove(recorded_filename)
+                    except Exception as e:
+                        logging.error(f"Failed to remove {recorded_filename} after processing: {e}")
+                        # Continue anyway - processed file was created successfully
                 else:
                     logging.error(f"FFmpeg processing failed for {recorded_filename}")
                     return
@@ -335,7 +424,10 @@ class TwitchRecorder:
         try:
             # Calculate reasonable timeout based on file size (1 hour per GB on slow devices)
             file_size_gb = os.path.getsize(recorded_filename) / (1024**3)
-            timeout_seconds = max(3600, int(file_size_gb * 3600))  # At least 1 hour, scale with file size
+            # Ensure minimum timeout and scale appropriately
+            timeout_seconds = max(3600, int(file_size_gb * 3600)) if file_size_gb > 0 else 3600
+            
+            logging.info(f"Processing {recorded_filename} ({file_size_gb:.2f}GB, timeout: {timeout_seconds}s)")
             
             # Use fast copy for audio (avoid re-encoding issues) and moderate H.264 settings for Pi
             result = subprocess.run([
@@ -383,6 +475,10 @@ class TwitchRecorder:
             
             response.raise_for_status()
             info = response.json()
+            # Validate response has expected structure
+            if "data" not in info:
+                logging.error(f"Unexpected API response for {username}: missing 'data' key")
+                return TwitchResponseStatus.ERROR, None
             return TwitchResponseStatus.ONLINE if info["data"] else TwitchResponseStatus.OFFLINE, info
             
         except requests.exceptions.RequestException as e:
@@ -404,7 +500,9 @@ class TwitchRecorder:
             destination = os.path.join(self.network_drive_path, filename)
             
             # Ensure destination directory exists
-            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            dest_dir = os.path.dirname(destination)
+            if dest_dir:  # Only create if there's actually a directory component
+                os.makedirs(dest_dir, exist_ok=True)
             
             # Copy file
             shutil.copy2(processed_filename, destination)
@@ -432,7 +530,10 @@ class TwitchRecorder:
             timestamp = datetime.datetime.now().strftime('%Y-%m-%d %Hh%Mm%Ss')
             title = channel.get('title', 'Unknown')
             # Sanitize filename
-            safe_title = "".join(c for c in title if c.isalnum() or c in [" ", "-", "_"])[:100]
+            safe_title = "".join(c for c in title if c.isalnum() or c in [" ", "-", "_"])[:100].strip()
+            # Ensure we have a valid title (fallback if all characters were stripped)
+            if not safe_title:
+                safe_title = "stream"
             filename = f"{username} - {timestamp} - {safe_title}.mp4"
             
             recorded_filename = os.path.join(recorded_path, filename)
@@ -446,20 +547,33 @@ class TwitchRecorder:
                 f"twitch.tv/{username}", self.quality, "-o", recorded_filename
             ]
             
+            # Use DEVNULL to prevent buffer overflow from unread pipes
             streamlink_process = subprocess.Popen(
-                streamlink_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                streamlink_cmd, 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL
             )
             
-            # Store process for cleanup
-            with self._active_recordings_lock:
+            # Store process for cleanup (with proper lock)
+            with self._recording_processes_lock:
                 self._recording_processes[username] = streamlink_process
 
             # Monitor recording with improved progress tracking
-            self._monitor_recording(streamlink_process, recorded_filename, filename)
-
-            # Clean up process reference
-            with self._active_recordings_lock:
-                self._recording_processes.pop(username, None)
+            try:
+                self._monitor_recording(streamlink_process, recorded_filename, filename)
+            finally:
+                # Always clean up process reference even if monitoring fails
+                with self._recording_processes_lock:
+                    self._recording_processes.pop(username, None)
+                
+                # Ensure process is terminated if still running
+                if streamlink_process.poll() is None:
+                    logging.warning(f"Streamlink process still running for {username}, terminating")
+                    try:
+                        streamlink_process.terminate()
+                        streamlink_process.wait(timeout=5)
+                    except:
+                        streamlink_process.kill()
 
             # Don't process immediately - let it happen during idle time in main loop
             if os.path.exists(recorded_filename) and os.path.getsize(recorded_filename) > 0:
@@ -473,39 +587,64 @@ class TwitchRecorder:
             self._decrement_recordings()
 
     def _monitor_recording(self, process, filename, display_name):
-        """Monitor recording process with better progress display"""
+        """Monitor recording process with better progress display and timeout"""
         try:
+            # Maximum recording time: 12 hours (configurable safety limit)
+            max_recording_time = 12 * 3600
+            start_time = time.time()
+            
             with tqdm(total=0, unit='B', unit_scale=True, desc=display_name[:50], ncols=100) as pbar:
                 last_size = 0
                 stalled_count = 0
+                file_check_failures = 0
                 
                 while process.poll() is None:
-                    if self._shutdown_event.is_set():
+                    # Check for overall timeout
+                    if time.time() - start_time > max_recording_time:
+                        logging.warning(f"Recording timeout ({max_recording_time}s) reached for {display_name}")
                         process.terminate()
                         break
-                        
-                    if os.path.exists(filename):
-                        current_size = os.path.getsize(filename)
-                        if current_size > last_size:
-                            pbar.total = current_size
-                            pbar.n = current_size
-                            pbar.refresh()
-                            last_size = current_size
-                            stalled_count = 0
-                        else:
-                            stalled_count += 1
-                            if stalled_count > 12:  # 1 minute of no growth
-                                logging.warning(f"Recording appears stalled for {display_name}")
+                    
+                    if self._shutdown_event.is_set():
+                        logging.info(f"Shutdown requested, stopping recording for {display_name}")
+                        process.terminate()
+                        break
+                    
+                    try:
+                        if os.path.exists(filename):
+                            current_size = os.path.getsize(filename)
+                            if current_size > last_size:
+                                pbar.total = current_size
+                                pbar.n = current_size
+                                pbar.refresh()
+                                last_size = current_size
                                 stalled_count = 0
+                                file_check_failures = 0
+                            else:
+                                stalled_count += 1
+                                if stalled_count > 12:  # 1 minute of no growth
+                                    logging.warning(f"Recording appears stalled for {display_name}")
+                                    stalled_count = 0  # Reset to avoid spam
+                        else:
+                            file_check_failures += 1
+                            if file_check_failures > 6:  # 30 seconds of missing file
+                                logging.error(f"Recording file not found for {display_name}, may have failed")
+                                file_check_failures = 0
+                    except OSError as e:
+                        logging.error(f"Error checking file size for {display_name}: {e}")
                     
                     time.sleep(5)
                 
                 # Final update
-                if os.path.exists(filename):
-                    final_size = os.path.getsize(filename)
-                    pbar.total = final_size
-                    pbar.n = final_size
-                    pbar.refresh()
+                try:
+                    if os.path.exists(filename):
+                        final_size = os.path.getsize(filename)
+                        pbar.total = final_size
+                        pbar.n = final_size
+                        pbar.refresh()
+                        logging.info(f"Recording complete: {display_name} ({final_size / (1024**2):.1f}MB)")
+                except OSError as e:
+                    logging.error(f"Error getting final file size: {e}")
                     
         except Exception as e:
             logging.error(f"Error monitoring recording: {e}")

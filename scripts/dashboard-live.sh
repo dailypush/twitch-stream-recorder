@@ -3,13 +3,15 @@
 # Twitch Recorder Dashboard - Live Update Mode (Flicker-free, Pi Zero optimized)
 # Uses lightweight /proc reads instead of top for CPU monitoring
 
-RECORDER_DIR="$HOME/twitch-recoder/twitch-stream-recorder"
-RECORDER_DIR="${TWITCH_RECORDER_DIR:-$RECORDER_DIR}"
-LOG_FILE="$RECORDER_DIR/twitch-recorder.log"
-RECORDING_DIR="$RECORDER_DIR/recording/recorded"
-PROCESSED_DIR="$RECORDER_DIR/recording/processed"
-CONFIG_FILE="$RECORDER_DIR/config.json"
-[ ! -f "$CONFIG_FILE" ] && CONFIG_FILE="$RECORDER_DIR/config/config.json"
+# Load shared configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/config.sh"
+
+RECORDER_DIR="$TWITCH_RECORDER_DIR"
+LOG_FILE="$TWITCH_RECORDER_MAIN_LOG"
+RECORDING_DIR="$TWITCH_RECORDER_RECORDED"
+PROCESSED_DIR="$TWITCH_RECORDER_PROCESSED"
+CONFIG_FILE="$TWITCH_RECORDER_CONFIG"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
@@ -53,8 +55,15 @@ DANCER6=(
 ' /|\\ '
 )
 
-trap "tput cnorm; clear; exit" INT TERM EXIT
-tput civis
+# Set TERM if not set (for SSH sessions) and check if tput works
+[ -z "$TERM" ] && export TERM=xterm
+if ! tput civis 2>/dev/null; then
+    # tput not available or not working, define no-op functions
+    tput() { :; }
+fi
+
+trap "tput cnorm 2>/dev/null; clear 2>/dev/null; exit" INT TERM EXIT
+tput civis 2>/dev/null
 
 format_bytes() {
     local bytes=$1
@@ -67,7 +76,7 @@ wl() {
     local row=$1 text="$2"
     local plain=$(echo -e "$text" | sed 's/\x1b\[[0-9;]*m//g')
     local pad=$((WIDTH - ${#plain})); [ $pad -lt 0 ] && pad=0
-    tput cup $row 0; printf "%b%*s" "$text" $pad ""
+    tput cup $row 0 2>/dev/null; printf "%b%*s" "$text" $pad ""
 }
 
 get_channels() {
@@ -78,7 +87,7 @@ get_recent_logs() {
     [ -f "$LOG_FILE" ] && grep -iE "online|offline|recording|error|started|stopped|failed" "$LOG_FILE" 2>/dev/null | tail -4
 }
 
-clear; tput cup 0 0
+clear 2>/dev/null; tput cup 0 0 2>/dev/null
 echo ""; echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════════════════${NC}"
 echo -e "${BOLD}${BLUE}           TWITCH RECORDER DASHBOARD (LIVE)${NC}"
 echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════════════════${NC}"

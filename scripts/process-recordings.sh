@@ -3,7 +3,11 @@
 # Batch process all recordings using Docker
 # Usage: ./process_recordings.sh
 
-RECORDINGS_DIR="/Volumes/rootfs/home/pi/twitch-recoder/twitch-stream-recorder/recording"
+# Load shared configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/config.sh"
+
+RECORDINGS_DIR="$TWITCH_RECORDER_RECORDING"
 DOCKER_IMAGE="twitch-recorder:latest"
 
 # Colors for output
@@ -35,8 +39,10 @@ for dir in "$RECORDINGS_DIR/recorded"/*; do
                 output_file="$output_dir/${filename}"
                 
                 # Skip if already processed
-                if [ -f "$output_file" ] && [ -s "$output_file" ] && [ $(stat -f%z "$output_file") -gt 1000000 ]; then
-                    echo -e "${GREEN}✓${NC} Already processed: $filename ($(numfmt --to=iec $(stat -f%z "$output_file")))"
+                output_size=$(stat -c%s "$output_file" 2>/dev/null || stat -f%z "$output_file" 2>/dev/null || echo 0)
+                if [ -f "$output_file" ] && [ -s "$output_file" ] && [ $output_size -gt 1000000 ]; then
+                    size_human=$(awk "BEGIN {printf \"%.1fM\", $output_size/1048576}")
+                    echo -e "${GREEN}✓${NC} Already processed: $filename (${size_human})"
                     PROCESSED=$((PROCESSED + 1))
                     continue
                 fi
@@ -62,8 +68,10 @@ for dir in "$RECORDINGS_DIR/recorded"/*; do
                 
                 if [ $? -eq 0 ]; then
                     # Verify output file size
-                    if [ -f "$output_file" ] && [ $(stat -f%z "$output_file") -gt 1000000 ]; then
-                        echo -e "${GREEN}✓ Success${NC}: $filename ($(numfmt --to=iec $(stat -f%z "$output_file")))"
+                    output_size=$(stat -c%s "$output_file" 2>/dev/null || stat -f%z "$output_file" 2>/dev/null || echo 0)
+                    if [ -f "$output_file" ] && [ $output_size -gt 1000000 ]; then
+                        size_human=$(awk "BEGIN {printf \"%.1fM\", $output_size/1048576}")
+                        echo -e "${GREEN}✓ Success${NC}: $filename (${size_human})"
                         PROCESSED=$((PROCESSED + 1))
                     else
                         echo -e "${RED}✗ Failed${NC}: Output file invalid for $filename"

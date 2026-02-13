@@ -4,8 +4,12 @@
 # Checks for corrupted or incomplete MP4 files
 # Run: ./validate-recordings.sh or add to cron
 
-RECORDING_DIR="$HOME/twitch-recoder/twitch-stream-recorder/recording/recorded"
-LOG_FILE="$HOME/twitch-recoder/twitch-stream-recorder/logs/validation.log"
+# Load shared configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/config.sh"
+
+RECORDING_DIR="$TWITCH_RECORDER_RECORDED"
+LOG_FILE="$TWITCH_RECORDER_VALIDATION_LOG"
 MIN_FILE_SIZE=10485760  # 10MB - suspicious if smaller
 
 # Colors
@@ -74,7 +78,7 @@ for channel_dir in "$RECORDING_DIR"/*; do
         
         # Check file integrity with ffprobe if available
         if [ "$USE_FFPROBE" = true ]; then
-            if ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1:noinvert_matches=0 "$file" &>/dev/null; then
+            if ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 "$file" &>/dev/null; then
                 echo -e "  ${GREEN}✓${NC} $filename ($(numfmt --to=iec-i --suffix=B $filesize 2>/dev/null || echo $filesize))"
                 VALID_FILES=$((VALID_FILES + 1))
             else
