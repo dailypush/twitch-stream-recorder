@@ -53,6 +53,12 @@ class TwitchRecorder:
         self.cpu_threshold = config_data.get("cpu_threshold", 80)
         self.memory_threshold = config_data.get("memory_threshold", 80)
         self.check_cpu_threshold = config_data.get("check_cpu_threshold", 50)
+        self.offline_backoff_enabled = config_data.get("offline_backoff_enabled", True)
+        self.offline_backoff_base_seconds = max(30, config_data.get("offline_backoff_base_seconds", self.refresh))
+        self.offline_backoff_max_seconds = max(
+            self.offline_backoff_base_seconds,
+            config_data.get("offline_backoff_max_seconds", 600)
+        )
         
         # Thread-safe counter and locks
         self._active_recordings_lock = threading.Lock()
@@ -62,6 +68,9 @@ class TwitchRecorder:
         self._shutdown_event = threading.Event()
         self._executor = None  # Store executor reference for cleanup
         self._token_refresh_lock = threading.Lock()  # Lock for token refresh
+        self._offline_backoff_lock = threading.Lock()
+        self._offline_check_counts = {}
+        self._next_user_check_at = {}
 
         # User configuration
         self.prune_after_days = config_data.get("prune_after_days", 30)
@@ -69,6 +78,7 @@ class TwitchRecorder:
         self.network_drive_path = config_data.get("network_drive_path", "")
         self.usernames = config_data.get("usernames", [])
         self.quality = config_data.get("stream_quality", "best")
+        self.max_processing_attempts = max(1, config_data.get("max_processing_attempts", 3))
 
         # Validate required fields
         if not self.usernames:
@@ -240,7 +250,10 @@ class TwitchRecorder:
                 if cpu_usage < self.check_cpu_threshold:
                     # Submit tasks for each username
                     future_to_username = {}
+                    current_time = time.time()
                     for username in self.usernames:
+                        if not self._should_check_user_now(username, current_time):
+                            continue
                         recorded_path, processed_path = paths[username]
                         future = self._executor.submit(self.check_and_record_user, username, recorded_path, processed_path)
                         future_to_username[future] = username
@@ -252,7 +265,8 @@ class TwitchRecorder:
                             username = future_to_username[future]
                             completed_futures.add(future)
                             try:
-                                future.result()
+                                status = future.result()
+                                self._update_user_check_schedule(username, status)
                             except Exception as e:
                                 logging.error(f"Error in thread for {username}: {e}")
                     except TimeoutError:
@@ -310,8 +324,46 @@ class TwitchRecorder:
                     self.record_stream(username, info, recorded_path, processed_path)
                 else:
                     logging.info(f"{Fore.YELLOW}Cannot start recording for {username} - resource limits")
+            return status
         except Exception as e:
             logging.error(f"Error checking {username}: {e}")
+            return TwitchResponseStatus.ERROR
+
+    def _should_check_user_now(self, username, current_time):
+        if not self.offline_backoff_enabled:
+            return True
+
+        with self._offline_backoff_lock:
+            next_check_time = self._next_user_check_at.get(username, 0)
+            return current_time >= next_check_time
+
+    def _reset_user_backoff(self, username):
+        with self._offline_backoff_lock:
+            self._offline_check_counts[username] = 0
+            self._next_user_check_at[username] = 0
+
+    def _update_user_check_schedule(self, username, status):
+        if not self.offline_backoff_enabled:
+            return
+
+        if status == TwitchResponseStatus.OFFLINE:
+            with self._offline_backoff_lock:
+                offline_count = self._offline_check_counts.get(username, 0) + 1
+                self._offline_check_counts[username] = offline_count
+
+                delay_seconds = min(
+                    self.offline_backoff_max_seconds,
+                    self.offline_backoff_base_seconds * (2 ** (offline_count - 1))
+                )
+                self._next_user_check_at[username] = time.time() + delay_seconds
+
+            logging.info(
+                f"{username} offline backoff: next check in {int(delay_seconds)}s "
+                f"(offline count: {offline_count})"
+            )
+            return
+
+        self._reset_user_backoff(username)
 
     def create_directories(self):
         """Create necessary directories with proper error handling"""
@@ -396,6 +448,7 @@ class TwitchRecorder:
             if self.disable_ffmpeg:
                 logging.info(f"Moving: {recorded_filename}")
                 shutil.move(recorded_filename, processed_filename)
+                self._clear_processing_attempts(recorded_filename)
             else:
                 # Double check we're still idle before starting ffmpeg
                 if self._active_recordings > 0:
@@ -404,6 +457,7 @@ class TwitchRecorder:
                     
                 logging.info(f"Processing with ffmpeg: {recorded_filename}")
                 if self.ffmpeg_copy_and_fix_errors(recorded_filename, processed_filename):
+                    self._clear_processing_attempts(recorded_filename)
                     try:
                         os.remove(recorded_filename)
                     except Exception as e:
@@ -411,6 +465,7 @@ class TwitchRecorder:
                         # Continue anyway - processed file was created successfully
                 else:
                     logging.error(f"FFmpeg processing failed for {recorded_filename}")
+                    self._record_processing_failure(recorded_filename)
                     return
             
             if self.upload_to_network_drive_enabled:
@@ -418,14 +473,71 @@ class TwitchRecorder:
                 
         except Exception as e:
             logging.error(f"Error processing file {recorded_filename}: {e}")
+            if os.path.exists(recorded_filename):
+                self._record_processing_failure(recorded_filename)
+
+    def _processing_attempts_file(self, recorded_filename):
+        return f"{recorded_filename}.attempts"
+
+    def _read_processing_attempts(self, recorded_filename):
+        attempts_file = self._processing_attempts_file(recorded_filename)
+        try:
+            if not os.path.exists(attempts_file):
+                return 0
+            with open(attempts_file, "r") as file:
+                return int(file.read().strip() or "0")
+        except Exception:
+            return 0
+
+    def _write_processing_attempts(self, recorded_filename, attempts):
+        attempts_file = self._processing_attempts_file(recorded_filename)
+        with open(attempts_file, "w") as file:
+            file.write(str(attempts))
+
+    def _clear_processing_attempts(self, recorded_filename):
+        attempts_file = self._processing_attempts_file(recorded_filename)
+        try:
+            if os.path.exists(attempts_file):
+                os.remove(attempts_file)
+        except Exception as e:
+            logging.warning(f"Failed clearing attempts file {attempts_file}: {e}")
+
+    def _quarantine_failed_recording(self, recorded_filename):
+        username = Path(recorded_filename).parent.name
+        failed_dir = os.path.join(self.root_path, "failed", username)
+        os.makedirs(failed_dir, exist_ok=True)
+
+        destination = os.path.join(failed_dir, os.path.basename(recorded_filename))
+        if os.path.exists(destination):
+            timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            stem, ext = os.path.splitext(os.path.basename(recorded_filename))
+            destination = os.path.join(failed_dir, f"{stem}.failed-{timestamp}{ext}")
+
+        shutil.move(recorded_filename, destination)
+        self._clear_processing_attempts(recorded_filename)
+        logging.error(
+            f"Quarantined recording after {self.max_processing_attempts} failed processing attempts: {destination}"
+        )
+
+    def _record_processing_failure(self, recorded_filename):
+        attempts = self._read_processing_attempts(recorded_filename) + 1
+        self._write_processing_attempts(recorded_filename, attempts)
+
+        logging.warning(
+            f"Processing attempt {attempts}/{self.max_processing_attempts} failed for {recorded_filename}"
+        )
+
+        if attempts >= self.max_processing_attempts:
+            try:
+                self._quarantine_failed_recording(recorded_filename)
+            except Exception as e:
+                logging.error(f"Failed to quarantine recording {recorded_filename}: {e}")
 
     def ffmpeg_copy_and_fix_errors(self, recorded_filename, processed_filename):
         """Run ffmpeg with H.264 compression and higher audio bitrate."""
         try:
-            # Calculate reasonable timeout based on file size (1 hour per GB on slow devices)
             file_size_gb = os.path.getsize(recorded_filename) / (1024**3)
-            # Ensure minimum timeout and scale appropriately
-            timeout_seconds = max(3600, int(file_size_gb * 3600)) if file_size_gb > 0 else 3600
+            timeout_seconds = self._calculate_ffmpeg_timeout(recorded_filename, file_size_gb)
             
             logging.info(f"Processing {recorded_filename} ({file_size_gb:.2f}GB, timeout: {timeout_seconds}s)")
             
@@ -457,6 +569,45 @@ class TwitchRecorder:
         except Exception as e:
             logging.error(f"FFmpeg error: {e}")
             return False
+
+    def _probe_media_duration_seconds(self, filename):
+        """Get media duration in seconds using ffprobe when available."""
+        try:
+            result = subprocess.run([
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                filename
+            ], capture_output=True, text=True, timeout=15)
+
+            if result.returncode != 0:
+                return None
+
+            duration = float(result.stdout.strip())
+            if duration > 0:
+                return duration
+            return None
+        except Exception:
+            return None
+
+    def _calculate_ffmpeg_timeout(self, recorded_filename, file_size_gb):
+        """Calculate timeout based on duration when possible, with conservative fallback for slow CPUs."""
+        duration_seconds = self._probe_media_duration_seconds(recorded_filename)
+        if duration_seconds:
+            timeout_seconds = max(5400, int(duration_seconds * 2.5) + 900)
+            logging.info(
+                f"Using duration-based timeout for {recorded_filename}: {timeout_seconds}s "
+                f"(duration: {duration_seconds:.0f}s)"
+            )
+            return timeout_seconds
+
+        timeout_seconds = max(5400, int(file_size_gb * 9000)) if file_size_gb > 0 else 5400
+        logging.info(
+            f"Using size-based timeout fallback for {recorded_filename}: {timeout_seconds}s "
+            f"(size: {file_size_gb:.2f}GB)"
+        )
+        return timeout_seconds
 
     def check_user(self, username):
         """Check if user is streaming with token refresh"""
