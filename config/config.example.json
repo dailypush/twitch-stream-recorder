@@ -1,5 +1,3 @@
-
-
 {
     "ffmpeg_path": "path/to/ffmpeg",
     "disable_ffmpeg": false,
@@ -15,5 +13,9 @@
     "usernames": ["username1", "username2"],
     "stream_quality": "best",
     "client_id": "YOUR_TWITCH_CLIENT_ID",
-    "client_secret": "YOUR_TWITCH_CLIENT_SECRET"
+    "client_secret": "YOUR_TWITCH_CLIENT_SECRET",
+    "idle_compress_enabled": true,
+    "idle_compress_crf": 28,
+    "idle_compress_preset": "medium",
+    "idle_compress_audio_bitrate": "128k"
 }

@@ -48,6 +48,10 @@ class TwitchRecorder:
         self.ffmpeg_path = config_data.get("ffmpeg_path", "ffmpeg")
         self.disable_ffmpeg = config_data.get("disable_ffmpeg", False)
         self.refresh = max(10, config_data.get("refresh_interval", 60))  # Minimum 10 seconds
+        self.idle_compress_enabled = config_data.get("idle_compress_enabled", True)
+        self.idle_compress_crf = config_data.get("idle_compress_crf", 28)
+        self.idle_compress_preset = config_data.get("idle_compress_preset", "medium")
+        self.idle_compress_audio_bitrate = config_data.get("idle_compress_audio_bitrate", "128k")
         self.root_path = config_data.get("root_path", "./recordings")
         self.max_concurrent_recordings = max(1, config_data.get("max_concurrent_recordings", 2))
         self.cpu_threshold = config_data.get("cpu_threshold", 80)
@@ -289,6 +293,12 @@ class TwitchRecorder:
                         for username in self.usernames:
                             recorded_path, processed_path = paths[username]
                             self.process_previous_recordings(recorded_path, processed_path)
+                    
+                    # Compress already-processed files when idle to save space
+                    if self._active_recordings == 0 and self.idle_compress_enabled and not self.disable_ffmpeg:
+                        for username in self.usernames:
+                            _, processed_path = paths[username]
+                            self.compress_processed_file(processed_path)
                 else:
                     logging.warning(f"High CPU usage ({cpu_usage}%). Pausing new checks.")
                 
@@ -534,24 +544,21 @@ class TwitchRecorder:
                 logging.error(f"Failed to quarantine recording {recorded_filename}: {e}")
 
     def ffmpeg_copy_and_fix_errors(self, recorded_filename, processed_filename):
-        """Run ffmpeg with H.264 compression and higher audio bitrate."""
+        """Remux recorded stream into a proper MP4 container (stream copy, no re-encoding)."""
         try:
             file_size_gb = os.path.getsize(recorded_filename) / (1024**3)
             timeout_seconds = self._calculate_ffmpeg_timeout(recorded_filename, file_size_gb)
             
             logging.info(f"Processing {recorded_filename} ({file_size_gb:.2f}GB, timeout: {timeout_seconds}s)")
             
-            # Use fast copy for audio (avoid re-encoding issues) and moderate H.264 settings for Pi
+            # Stream copy: remux MPEG-TS into proper MP4 container without re-encoding
+            # This is fast, preserves original quality, and produces player-compatible files
             result = subprocess.run([
                 self.ffmpeg_path, 
                 "-err_detect", "ignore_err",
                 "-i", recorded_filename,
-                "-c:v", "libx264",           # H.264 codec for efficient compression
-                "-crf", "28",                # Slightly lower quality (28 instead of 23) for speed on Pi
-                "-preset", "medium",         # Medium preset (faster than slower for Raspberry Pi)
-                "-c:a", "aac",               # Re-encode audio to AAC
-                "-b:a", "128k",              # Reduced audio bitrate (DJ quality at 128k is sufficient)
-                "-movflags", "+faststart",   # Optimize for streaming
+                "-c", "copy",                # Copy all streams without re-encoding
+                "-movflags", "+faststart",   # Optimize for streaming/seeking
                 "-y",                        # Overwrite output file
                 processed_filename
             ], capture_output=True, text=True, timeout=timeout_seconds)
@@ -569,6 +576,84 @@ class TwitchRecorder:
         except Exception as e:
             logging.error(f"FFmpeg error: {e}")
             return False
+
+    def compress_processed_file(self, processed_path):
+        """Compress ONE processed file per call using H.264 re-encoding to save space.
+        
+        Skips files that have already been compressed (marked with .compressed marker).
+        Only runs when the system is idle (no active recordings).
+        """
+        try:
+            video_files = [f for f in os.listdir(processed_path)
+                          if os.path.isfile(os.path.join(processed_path, f))
+                          and f.endswith('.mp4')
+                          and not os.path.exists(os.path.join(processed_path, f + '.compressed'))]
+            
+            if not video_files:
+                return
+            
+            filename = video_files[0]
+            source = os.path.join(processed_path, filename)
+            temp_output = source + '.compressing'
+            marker = source + '.compressed'
+            
+            file_size_gb = os.path.getsize(source) / (1024**3)
+            timeout_seconds = self._calculate_ffmpeg_timeout(source, file_size_gb)
+            
+            logging.info(f"Idle compress: {filename} ({file_size_gb:.2f}GB)")
+            
+            # Bail out if a recording starts
+            if self._active_recordings > 0:
+                logging.info("Recording started, postponing idle compression")
+                return
+            
+            result = subprocess.run([
+                self.ffmpeg_path,
+                "-i", source,
+                "-c:v", "libx264",
+                "-crf", str(self.idle_compress_crf),
+                "-preset", self.idle_compress_preset,
+                "-c:a", "aac",
+                "-b:a", self.idle_compress_audio_bitrate,
+                "-movflags", "+faststart",
+                "-y",
+                temp_output
+            ], capture_output=True, text=True, timeout=timeout_seconds)
+            
+            if result.returncode != 0:
+                logging.error(f"Idle compress failed for {filename}: {result.stderr}")
+                if os.path.exists(temp_output):
+                    os.remove(temp_output)
+                return
+            
+            # Verify compressed file is valid and smaller
+            if os.path.exists(temp_output) and os.path.getsize(temp_output) > 0:
+                original_size = os.path.getsize(source)
+                compressed_size = os.path.getsize(temp_output)
+                savings = (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
+                
+                if compressed_size < original_size:
+                    os.replace(temp_output, source)
+                    # Mark as compressed so we don't re-process
+                    with open(marker, 'w') as f:
+                        f.write(f"compressed {datetime.datetime.now().isoformat()} savings={savings:.1f}%")
+                    logging.info(f"Compressed {filename}: {original_size/(1024**2):.1f}MB -> {compressed_size/(1024**2):.1f}MB ({savings:.1f}% saved)")
+                else:
+                    os.remove(temp_output)
+                    # Mark anyway so we skip it next time
+                    with open(marker, 'w') as f:
+                        f.write(f"skipped {datetime.datetime.now().isoformat()} already-small")
+                    logging.info(f"Skipped compressing {filename} (already efficient)")
+            else:
+                if os.path.exists(temp_output):
+                    os.remove(temp_output)
+                    
+        except subprocess.TimeoutExpired:
+            logging.error(f"Idle compress timeout for {processed_path}")
+            if os.path.exists(temp_output):
+                os.remove(temp_output)
+        except Exception as e:
+            logging.error(f"Idle compress error: {e}")
 
     def _probe_media_duration_seconds(self, filename):
         """Get media duration in seconds using ffprobe when available."""
