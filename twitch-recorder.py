@@ -180,6 +180,20 @@ class TwitchRecorder:
         with self._active_recordings_lock:
             self._active_recordings = max(0, self._active_recordings - 1)
 
+    def _is_user_recording(self, username):
+        """Return True when a live streamlink process already exists for this user."""
+        with self._recording_processes_lock:
+            process = self._recording_processes.get(username)
+            if not process:
+                return False
+
+            if process.poll() is None:
+                return True
+
+            # Clean up stale completed process entries.
+            self._recording_processes.pop(username, None)
+            return False
+
     def can_start_new_recording(self):
         if self.active_recordings >= self.max_concurrent_recordings:
             return False
@@ -330,6 +344,11 @@ class TwitchRecorder:
                 logging.info(f"{Fore.RED}Unauthorized, refreshing access token")
                 self.fetch_access_token()
             elif status == TwitchResponseStatus.ONLINE:
+                if self._is_user_recording(username):
+                    logging.info(
+                        f"{Fore.YELLOW}{username} already has an active recording process; skipping duplicate start"
+                    )
+                    return status
                 if self.can_start_new_recording():
                     self.record_stream(username, info, recorded_path, processed_path)
                 else:
@@ -760,6 +779,10 @@ class TwitchRecorder:
     def record_stream(self, username, info, recorded_path, processed_path):
         """Record a stream with proper process management"""
         try:
+            if self._is_user_recording(username):
+                logging.info(f"{Fore.YELLOW}Recording already active for {username}, skipping duplicate launch")
+                return
+
             self._increment_recordings()
             
             channel = info["data"][0]
