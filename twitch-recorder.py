@@ -68,6 +68,7 @@ class TwitchRecorder:
         self._active_recordings_lock = threading.Lock()
         self._active_recordings = 0
         self._recording_processes = {}  # Track active processes
+        self._pending_recordings = set()  # Users currently launching streamlink
         self._recording_processes_lock = threading.Lock()  # Separate lock for processes dict
         self._shutdown_event = threading.Event()
         self._executor = None  # Store executor reference for cleanup
@@ -166,6 +167,7 @@ class TwitchRecorder:
         
         with self._recording_processes_lock:
             self._recording_processes.clear()
+            self._pending_recordings.clear()
 
     @property
     def active_recordings(self):
@@ -183,6 +185,9 @@ class TwitchRecorder:
     def _is_user_recording(self, username):
         """Return True when a live streamlink process already exists for this user."""
         with self._recording_processes_lock:
+            if username in self._pending_recordings:
+                return True
+
             process = self._recording_processes.get(username)
             if not process:
                 return False
@@ -779,9 +784,17 @@ class TwitchRecorder:
     def record_stream(self, username, info, recorded_path, processed_path):
         """Record a stream with proper process management"""
         try:
-            if self._is_user_recording(username):
-                logging.info(f"{Fore.YELLOW}Recording already active for {username}, skipping duplicate launch")
-                return
+            # Atomically reserve this user before process launch to prevent race duplicates.
+            with self._recording_processes_lock:
+                existing_process = self._recording_processes.get(username)
+                if username in self._pending_recordings or (
+                    existing_process and existing_process.poll() is None
+                ):
+                    logging.info(
+                        f"{Fore.YELLOW}Recording already active for {username}, skipping duplicate launch"
+                    )
+                    return
+                self._pending_recordings.add(username)
 
             self._increment_recordings()
             
@@ -816,6 +829,7 @@ class TwitchRecorder:
             # Store process for cleanup (with proper lock)
             with self._recording_processes_lock:
                 self._recording_processes[username] = streamlink_process
+                self._pending_recordings.discard(username)
 
             # Monitor recording with improved progress tracking
             try:
@@ -824,6 +838,7 @@ class TwitchRecorder:
                 # Always clean up process reference even if monitoring fails
                 with self._recording_processes_lock:
                     self._recording_processes.pop(username, None)
+                    self._pending_recordings.discard(username)
                 
                 # Ensure process is terminated if still running
                 if streamlink_process.poll() is None:
@@ -843,6 +858,8 @@ class TwitchRecorder:
         except Exception as e:
             logging.error(f"Error recording {username}: {e}")
         finally:
+            with self._recording_processes_lock:
+                self._pending_recordings.discard(username)
             self._decrement_recordings()
 
     def _monitor_recording(self, process, filename, display_name):
