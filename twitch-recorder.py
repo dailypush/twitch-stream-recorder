@@ -69,7 +69,12 @@ class TwitchRecorder:
         self._active_recordings = 0
         self._recording_processes = {}  # Track active processes
         self._pending_recordings = set()  # Users currently launching streamlink
+        self._recording_threads = {}  # Track long-running recording threads
+        self._recording_stream_ids = {}  # Track active Twitch stream IDs per user
         self._recording_processes_lock = threading.Lock()  # Separate lock for processes dict
+        self._recording_slots = threading.BoundedSemaphore(self.max_concurrent_recordings)
+        self._idle_processing_thread = None
+        self._idle_processing_lock = threading.Lock()
         self._shutdown_event = threading.Event()
         self._executor = None  # Store executor reference for cleanup
         self._token_refresh_lock = threading.Lock()  # Lock for token refresh
@@ -151,6 +156,7 @@ class TwitchRecorder:
         """Clean up any running recording processes"""
         with self._recording_processes_lock:
             processes_to_cleanup = list(self._recording_processes.items())
+            threads_to_join = list(self._recording_threads.items())
             
         for username, process in processes_to_cleanup:
             if process and process.poll() is None:
@@ -168,6 +174,18 @@ class TwitchRecorder:
         with self._recording_processes_lock:
             self._recording_processes.clear()
             self._pending_recordings.clear()
+            self._recording_stream_ids.clear()
+
+        for username, thread in threads_to_join:
+            if thread.is_alive():
+                logging.info(f"Waiting for recording thread for {username} to stop")
+                thread.join(timeout=15)
+
+        with self._idle_processing_lock:
+            idle_thread = self._idle_processing_thread
+        if idle_thread and idle_thread.is_alive():
+            logging.info("Waiting for idle processing thread to stop")
+            idle_thread.join(timeout=15)
 
     @property
     def active_recordings(self):
@@ -182,11 +200,23 @@ class TwitchRecorder:
         with self._active_recordings_lock:
             self._active_recordings = max(0, self._active_recordings - 1)
 
+    def _get_stream_id(self, info):
+        try:
+            return info["data"][0].get("id")
+        except (KeyError, IndexError, TypeError):
+            return None
+
     def _is_user_recording(self, username):
         """Return True when a live streamlink process already exists for this user."""
         with self._recording_processes_lock:
             if username in self._pending_recordings:
                 return True
+
+            thread = self._recording_threads.get(username)
+            if thread and thread.is_alive():
+                return True
+            if thread:
+                self._recording_threads.pop(username, None)
 
             process = self._recording_processes.get(username)
             if not process:
@@ -198,6 +228,114 @@ class TwitchRecorder:
             # Clean up stale completed process entries.
             self._recording_processes.pop(username, None)
             return False
+
+    def _reserve_recording(self, username, stream_id=None):
+        """Atomically reserve a per-user recording and one global recording slot."""
+        with self._recording_processes_lock:
+            if username in self._pending_recordings:
+                return False, "launch already pending"
+
+            existing_thread = self._recording_threads.get(username)
+            if existing_thread and existing_thread.is_alive():
+                active_stream_id = self._recording_stream_ids.get(username)
+                if stream_id and active_stream_id == stream_id:
+                    return False, f"stream {stream_id} is already being recorded"
+                return False, "recording thread already active"
+            if existing_thread:
+                self._recording_threads.pop(username, None)
+
+            existing_process = self._recording_processes.get(username)
+            if existing_process and existing_process.poll() is None:
+                active_stream_id = self._recording_stream_ids.get(username)
+                if stream_id and active_stream_id == stream_id:
+                    return False, f"stream {stream_id} is already being recorded"
+                return False, "recording process already active"
+            if existing_process:
+                self._recording_processes.pop(username, None)
+
+            if not self._recording_slots.acquire(blocking=False):
+                return False, "maximum concurrent recordings reached"
+
+            self._pending_recordings.add(username)
+            if stream_id:
+                self._recording_stream_ids[username] = stream_id
+            self._increment_recordings()
+            return True, None
+
+    def _release_recording_reservation(self, username):
+        with self._recording_processes_lock:
+            self._pending_recordings.discard(username)
+            self._recording_processes.pop(username, None)
+            self._recording_threads.pop(username, None)
+            self._recording_stream_ids.pop(username, None)
+
+        self._decrement_recordings()
+        try:
+            self._recording_slots.release()
+        except ValueError:
+            logging.error(f"Recording slot for {username} was released more than once")
+
+    def _start_recording_thread(self, username, info, recorded_path, processed_path):
+        stream_id = self._get_stream_id(info)
+        reserved, reason = self._reserve_recording(username, stream_id)
+        if not reserved:
+            logging.info(f"{Fore.YELLOW}Cannot start recording for {username}: {reason}")
+            return False
+
+        thread = threading.Thread(
+            target=self.record_stream,
+            args=(username, info, recorded_path, processed_path),
+            name=f"record-{username}",
+        )
+
+        start_error = None
+        with self._recording_processes_lock:
+            self._recording_threads[username] = thread
+            try:
+                thread.start()
+            except Exception as e:
+                start_error = e
+                self._recording_threads.pop(username, None)
+
+        if start_error:
+            self._release_recording_reservation(username)
+            raise start_error
+
+        return True
+
+    def _start_idle_processing_thread(self, paths):
+        if self.disable_ffmpeg or self.active_recordings > 0:
+            return
+
+        with self._idle_processing_lock:
+            if self._idle_processing_thread and self._idle_processing_thread.is_alive():
+                return
+
+            self._idle_processing_thread = threading.Thread(
+                target=self._run_idle_processing,
+                args=(paths,),
+                name="idle-processing",
+            )
+            self._idle_processing_thread.start()
+
+    def _run_idle_processing(self, paths):
+        try:
+            for username in self.usernames:
+                if self._shutdown_event.is_set() or self.active_recordings > 0:
+                    return
+                recorded_path, processed_path = paths[username]
+                self.process_previous_recordings(recorded_path, processed_path)
+
+            if not self.idle_compress_enabled:
+                return
+
+            for username in self.usernames:
+                if self._shutdown_event.is_set() or self.active_recordings > 0:
+                    return
+                _, processed_path = paths[username]
+                self.compress_processed_file(processed_path)
+        except Exception as e:
+            logging.error(f"Idle processing error: {e}")
 
     def can_start_new_recording(self):
         if self.active_recordings >= self.max_concurrent_recordings:
@@ -307,17 +445,8 @@ class TwitchRecorder:
                             logging.warning(f"Task for {username} timed out")
                             future.cancel()
                     
-                    # Process old recordings ONLY when idle (no active recordings)
-                    if self._active_recordings == 0 and not self.disable_ffmpeg:
-                        for username in self.usernames:
-                            recorded_path, processed_path = paths[username]
-                            self.process_previous_recordings(recorded_path, processed_path)
-                    
-                    # Compress already-processed files when idle to save space
-                    if self._active_recordings == 0 and self.idle_compress_enabled and not self.disable_ffmpeg:
-                        for username in self.usernames:
-                            _, processed_path = paths[username]
-                            self.compress_processed_file(processed_path)
+                    # Process old recordings in the background so polling can continue.
+                    self._start_idle_processing_thread(paths)
                 else:
                     logging.warning(f"High CPU usage ({cpu_usage}%). Pausing new checks.")
                 
@@ -355,7 +484,7 @@ class TwitchRecorder:
                     )
                     return status
                 if self.can_start_new_recording():
-                    self.record_stream(username, info, recorded_path, processed_path)
+                    self._start_recording_thread(username, info, recorded_path, processed_path)
                 else:
                     logging.info(f"{Fore.YELLOW}Cannot start recording for {username} - resource limits")
             return status
@@ -485,7 +614,7 @@ class TwitchRecorder:
                 self._clear_processing_attempts(recorded_filename)
             else:
                 # Double check we're still idle before starting ffmpeg
-                if self._active_recordings > 0:
+                if self.active_recordings > 0:
                     logging.info(f"Stream recording started, postponing ffmpeg processing")
                     return
                     
@@ -627,7 +756,7 @@ class TwitchRecorder:
             logging.info(f"Idle compress: {filename} ({file_size_gb:.2f}GB)")
             
             # Bail out if a recording starts
-            if self._active_recordings > 0:
+            if self.active_recordings > 0:
                 logging.info("Recording started, postponing idle compression")
                 return
             
@@ -783,21 +912,8 @@ class TwitchRecorder:
 
     def record_stream(self, username, info, recorded_path, processed_path):
         """Record a stream with proper process management"""
+        streamlink_process = None
         try:
-            # Atomically reserve this user before process launch to prevent race duplicates.
-            with self._recording_processes_lock:
-                existing_process = self._recording_processes.get(username)
-                if username in self._pending_recordings or (
-                    existing_process and existing_process.poll() is None
-                ):
-                    logging.info(
-                        f"{Fore.YELLOW}Recording already active for {username}, skipping duplicate launch"
-                    )
-                    return
-                self._pending_recordings.add(username)
-
-            self._increment_recordings()
-            
             channel = info["data"][0]
             timestamp = datetime.datetime.now().strftime('%Y-%m-%d %Hh%Mm%Ss')
             title = channel.get('title', 'Unknown')
@@ -858,9 +974,7 @@ class TwitchRecorder:
         except Exception as e:
             logging.error(f"Error recording {username}: {e}")
         finally:
-            with self._recording_processes_lock:
-                self._pending_recordings.discard(username)
-            self._decrement_recordings()
+            self._release_recording_reservation(username)
 
     def _monitor_recording(self, process, filename, display_name):
         """Monitor recording process with better progress display and timeout"""
