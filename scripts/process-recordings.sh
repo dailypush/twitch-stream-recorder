@@ -24,6 +24,21 @@ echo ""
 TOTAL=0
 PROCESSED=0
 FAILED=0
+temp_output=""
+trap 'if [ -n "$temp_output" ]; then rm -f -- "$temp_output"; fi' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+valid_output() {
+    local host_file="$1"
+    local container_file="$2"
+    local duration
+    [ -s "$host_file" ] || return 1
+    duration=$(docker run --rm -v "$RECORDINGS_DIR:/recordings" "$DOCKER_IMAGE" \
+        ffprobe -v error -show_entries format=duration \
+        -of default=noprint_wrappers=1:nokey=1 "$container_file") || return 1
+    awk -v duration="$duration" 'BEGIN {exit !(duration ~ /^[0-9]+([.][0-9]+)?$/ && duration + 0 > 0)}'
+}
 
 # Process each recorded file
 for dir in "$RECORDINGS_DIR/recorded"/*; do
@@ -37,17 +52,24 @@ for dir in "$RECORDINGS_DIR/recorded"/*; do
                 filename=$(basename "$file")
                 output_dir="$RECORDINGS_DIR/processed/$username"
                 output_file="$output_dir/${filename}"
+                if ! mkdir -p "$output_dir"; then
+                    FAILED=$((FAILED + 1))
+                    continue
+                fi
                 
                 # Skip if already processed
-                output_size=$(stat -c%s "$output_file" 2>/dev/null || stat -f%z "$output_file" 2>/dev/null || echo 0)
-                if [ -f "$output_file" ] && [ -s "$output_file" ] && [ $output_size -gt 1000000 ]; then
-                    size_human=$(awk "BEGIN {printf \"%.1fM\", $output_size/1048576}")
-                    echo -e "${GREEN}✓${NC} Already processed: $filename (${size_human})"
+                if valid_output "$output_file" "/recordings/processed/$username/$filename"; then
+                    echo -e "${GREEN}✓${NC} Already processed: $filename"
                     PROCESSED=$((PROCESSED + 1))
                     continue
                 fi
                 
                 echo "  Processing: $filename"
+                temp_output=$(mktemp "$output_dir/.processing.XXXXXX") || {
+                    FAILED=$((FAILED + 1))
+                    continue
+                }
+                container_output="/recordings/processed/$username/$(basename "$temp_output")"
                 
                 # Run FFmpeg inside Docker
                 docker run --rm \
@@ -62,16 +84,15 @@ for dir in "$RECORDINGS_DIR/recorded"/*; do
                     -c:a aac \
                     -b:a 128k \
                     -movflags +faststart \
+                    -f mp4 \
                     -y \
-                    "/recordings/processed/$username/$filename" \
+                    "$container_output" \
                     2>&1 | grep -E "frame=|Error|error"
+                ffmpeg_status=${PIPESTATUS[0]}
                 
-                if [ $? -eq 0 ]; then
-                    # Verify output file size
-                    output_size=$(stat -c%s "$output_file" 2>/dev/null || stat -f%z "$output_file" 2>/dev/null || echo 0)
-                    if [ -f "$output_file" ] && [ $output_size -gt 1000000 ]; then
-                        size_human=$(awk "BEGIN {printf \"%.1fM\", $output_size/1048576}")
-                        echo -e "${GREEN}✓ Success${NC}: $filename (${size_human})"
+                if [ "$ffmpeg_status" -eq 0 ]; then
+                    if valid_output "$temp_output" "$container_output" && mv -f -- "$temp_output" "$output_file"; then
+                        echo -e "${GREEN}✓ Success${NC}: $filename"
                         PROCESSED=$((PROCESSED + 1))
                     else
                         echo -e "${RED}✗ Failed${NC}: Output file invalid for $filename"
@@ -81,6 +102,8 @@ for dir in "$RECORDINGS_DIR/recorded"/*; do
                     echo -e "${RED}✗ Failed${NC}: FFmpeg error for $filename"
                     FAILED=$((FAILED + 1))
                 fi
+                rm -f -- "$temp_output"
+                temp_output=""
             fi
         done
     fi
@@ -91,3 +114,4 @@ echo -e "${YELLOW}Processing complete!${NC}"
 echo "Total files: $TOTAL"
 echo -e "Processed: ${GREEN}$PROCESSED${NC}"
 echo -e "Failed: ${RED}$FAILED${NC}"
+[ "$FAILED" -eq 0 ]

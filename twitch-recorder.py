@@ -1,4 +1,5 @@
 import datetime
+import errno
 import enum
 import getopt
 import logging
@@ -12,6 +13,7 @@ import psutil
 import json
 import threading
 import signal
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from tqdm import tqdm
 from pathlib import Path
@@ -25,6 +27,9 @@ class TwitchResponseStatus(enum.Enum):
     NOT_FOUND = 2
     UNAUTHORIZED = 3
     ERROR = 4
+
+class ProcessingInterrupted(Exception):
+    """Background work yielded to recording or shutdown; this is not a failure."""
 
 class TwitchRecorder:
     def __init__(self):
@@ -52,11 +57,14 @@ class TwitchRecorder:
         self.idle_compress_crf = config_data.get("idle_compress_crf", 28)
         self.idle_compress_preset = config_data.get("idle_compress_preset", "medium")
         self.idle_compress_audio_bitrate = config_data.get("idle_compress_audio_bitrate", "128k")
+        self.processing_threads = max(1, config_data.get("processing_threads", 1))
+        self.recording_stall_timeout = max(30, config_data.get("recording_stall_timeout_seconds", 300))
+        self.retention_check_interval = max(60, config_data.get("retention_check_interval_seconds", 3600))
+        self._next_prune_at = 0
         self.root_path = config_data.get("root_path", "./recordings")
         self.max_concurrent_recordings = max(1, config_data.get("max_concurrent_recordings", 2))
         self.cpu_threshold = config_data.get("cpu_threshold", 80)
         self.memory_threshold = config_data.get("memory_threshold", 80)
-        self.check_cpu_threshold = config_data.get("check_cpu_threshold", 50)
         self.offline_backoff_enabled = config_data.get("offline_backoff_enabled", True)
         self.offline_backoff_base_seconds = max(30, config_data.get("offline_backoff_base_seconds", self.refresh))
         self.offline_backoff_max_seconds = max(
@@ -75,6 +83,7 @@ class TwitchRecorder:
         self._recording_slots = threading.BoundedSemaphore(self.max_concurrent_recordings)
         self._idle_processing_thread = None
         self._idle_processing_lock = threading.Lock()
+        self._processing_active = threading.Event()
         self._shutdown_event = threading.Event()
         self._executor = None  # Store executor reference for cleanup
         self._token_refresh_lock = threading.Lock()  # Lock for token refresh
@@ -142,6 +151,14 @@ class TwitchRecorder:
                 self.disable_ffmpeg = True
             except Exception as e:
                 logging.warning(f"Could not verify ffmpeg: {e}")
+
+        if not self.disable_ffmpeg:
+            try:
+                subprocess.run([str(Path(self.ffmpeg_path).with_name('ffprobe')), '-version'],
+                               capture_output=True, timeout=5, check=True)
+            except (OSError, subprocess.SubprocessError) as e:
+                logging.error(f"FFprobe is required to validate processed recordings: {e}")
+                sys.exit(1)
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals safely"""
@@ -276,6 +293,8 @@ class TwitchRecorder:
             logging.error(f"Recording slot for {username} was released more than once")
 
     def _start_recording_thread(self, username, info, recorded_path, processed_path):
+        if self._shutdown_event.is_set():
+            return False
         stream_id = self._get_stream_id(info)
         reserved, reason = self._reserve_recording(username, stream_id)
         if not reserved:
@@ -304,7 +323,7 @@ class TwitchRecorder:
         return True
 
     def _start_idle_processing_thread(self, paths):
-        if self.disable_ffmpeg or self.active_recordings > 0:
+        if self._shutdown_event.is_set() or self.active_recordings > 0:
             return
 
         with self._idle_processing_lock:
@@ -323,10 +342,15 @@ class TwitchRecorder:
             for username in self.usernames:
                 if self._shutdown_event.is_set() or self.active_recordings > 0:
                     return
+                self._retry_pending_uploads(paths[username][1])
+
+            for username in self.usernames:
+                if self._shutdown_event.is_set() or self.active_recordings > 0:
+                    return
                 recorded_path, processed_path = paths[username]
                 self.process_previous_recordings(recorded_path, processed_path)
 
-            if not self.idle_compress_enabled:
+            if self.disable_ffmpeg or not self.idle_compress_enabled:
                 return
 
             for username in self.usernames:
@@ -344,7 +368,8 @@ class TwitchRecorder:
         cpu_usage = psutil.cpu_percent(interval=1)
         memory_usage = psutil.virtual_memory().percent
         
-        if cpu_usage > self.cpu_threshold or memory_usage > self.memory_threshold:
+        # Background FFmpeg yields as soon as a recording reserves a slot.
+        if (cpu_usage > self.cpu_threshold and not self._processing_active.is_set()) or memory_usage > self.memory_threshold:
             logging.warning(f"High resource usage: CPU {cpu_usage}%, Memory {memory_usage}%")
             return False
         
@@ -361,19 +386,19 @@ class TwitchRecorder:
         
         return True
 
-    def fetch_access_token(self):
+    def fetch_access_token(self, rejected_token=None):
         """Fetch or refresh access token with proper error handling and thread safety"""
         try:
             current_time = time.time()
             # Refresh token if it expires in the next 5 minutes
-            if self.access_token and current_time < (self.token_expires_at - 300):
+            if self.access_token and self.access_token != rejected_token and current_time < (self.token_expires_at - 300):
                 return self.access_token
 
             # Use lock to prevent multiple threads from refreshing simultaneously
             with self._token_refresh_lock:
                 # Double-check after acquiring lock (another thread may have refreshed)
                 current_time = time.time()
-                if self.access_token and current_time < (self.token_expires_at - 300):
+                if self.access_token and self.access_token != rejected_token and current_time < (self.token_expires_at - 300):
                     return self.access_token
                     
                 logging.info("Fetching new access token")
@@ -395,67 +420,50 @@ class TwitchRecorder:
         """Main run loop with proper threading"""
         paths = self.create_directories()
         
-        # Don't process old recordings at startup - do it during idle time
-        # Just prune old files
-        for username in self.usernames:
-            recorded_path, processed_path = paths[username]
-            self.prune_old_files(recorded_path)
-            self.prune_old_files(processed_path)
-
         # Use ThreadPoolExecutor for concurrent recording checks
         self._executor = ThreadPoolExecutor(max_workers=min(len(self.usernames), 5))
         try:
             while not self._shutdown_event.is_set():
-                cpu_usage = psutil.cpu_percent(interval=1)
+                self._prune_if_due(paths)
+                # Submit tasks for each username
+                future_to_username = {}
+                current_time = time.time()
+                for username in self.usernames:
+                    if not self._should_check_user_now(username, current_time):
+                        continue
+                    recorded_path, processed_path = paths[username]
+                    future = self._executor.submit(self.check_and_record_user, username, recorded_path, processed_path)
+                    future_to_username[future] = username
                 
-                if cpu_usage < self.check_cpu_threshold:
-                    # Submit tasks for each username
-                    future_to_username = {}
-                    current_time = time.time()
-                    for username in self.usernames:
-                        if not self._should_check_user_now(username, current_time):
-                            continue
-                        recorded_path, processed_path = paths[username]
-                        future = self._executor.submit(self.check_and_record_user, username, recorded_path, processed_path)
-                        future_to_username[future] = username
-                    
-                    # Wait for all tasks to complete with proper timeout handling
-                    completed_futures = set()
-                    try:
-                        for future in as_completed(future_to_username, timeout=self.refresh):
-                            username = future_to_username[future]
-                            completed_futures.add(future)
-                            try:
-                                status = future.result()
-                                self._update_user_check_schedule(username, status)
-                            except Exception as e:
-                                logging.error(f"Error in thread for {username}: {e}")
-                    except TimeoutError:
-                        # Handle futures that didn't complete in time
-                        incomplete = set(future_to_username.keys()) - completed_futures
-                        for future in incomplete:
-                            username = future_to_username[future]
-                            logging.warning(f"Task for {username} did not complete in time")
-                            future.cancel()  # Attempt to cancel
-                    except FuturesTimeoutError:
-                        # Handle futures that didn't complete in time  
-                        incomplete = set(future_to_username.keys()) - completed_futures
-                        for future in incomplete:
-                            username = future_to_username[future]
-                            logging.warning(f"Task for {username} timed out")
-                            future.cancel()
-                    
-                    # Process old recordings in the background so polling can continue.
-                    self._start_idle_processing_thread(paths)
-                else:
-                    logging.warning(f"High CPU usage ({cpu_usage}%). Pausing new checks.")
+                # Wait for all tasks to complete with proper timeout handling
+                completed_futures = set()
+                try:
+                    for future in as_completed(future_to_username, timeout=self.refresh):
+                        username = future_to_username[future]
+                        completed_futures.add(future)
+                        try:
+                            status = future.result()
+                            self._update_user_check_schedule(username, status)
+                        except Exception as e:
+                            logging.error(f"Error in thread for {username}: {e}")
+                except (TimeoutError, FuturesTimeoutError):
+                    # Handle futures that didn't complete in time
+                    incomplete = set(future_to_username.keys()) - completed_futures
+                    for future in incomplete:
+                        username = future_to_username[future]
+                        logging.warning(f"Task for {username} did not complete in time")
+                        future.cancel()  # Attempt to cancel
                 
+                # Process old recordings in the background so polling can continue.
+                self._start_idle_processing_thread(paths)
+
                 # Wait for next cycle
                 if not self._shutdown_event.wait(timeout=self.refresh):
                     continue
                 else:
                     break
         finally:
+            self._shutdown_event.set()
             # Graceful shutdown of executor
             logging.info("Shutting down executor...")
             if self._executor:
@@ -467,6 +475,8 @@ class TwitchRecorder:
     def check_and_record_user(self, username, recorded_path, processed_path):
         """Check and potentially record a single user"""
         try:
+            if self._shutdown_event.is_set():
+                return TwitchResponseStatus.ERROR
             logging.info(f"Checking {username}")
             status, info = self.check_user(username)
             
@@ -475,8 +485,7 @@ class TwitchRecorder:
             elif status == TwitchResponseStatus.OFFLINE:
                 logging.info(f"{Fore.YELLOW}{username} currently offline")
             elif status == TwitchResponseStatus.UNAUTHORIZED:
-                logging.info(f"{Fore.RED}Unauthorized, refreshing access token")
-                self.fetch_access_token()
+                logging.error(f"{Fore.RED}Unauthorized after token refresh; will retry next check")
             elif status == TwitchResponseStatus.ONLINE:
                 if self._is_user_recording(username):
                     logging.info(
@@ -546,6 +555,20 @@ class TwitchRecorder:
             sys.exit(1)
         return paths
 
+    def _prune_if_due(self, paths):
+        now = time.monotonic()
+        if now < self._next_prune_at:
+            return
+        # Processing can replace files and markers. Defer maintenance while it runs.
+        with self._idle_processing_lock:
+            if self._idle_processing_thread and self._idle_processing_thread.is_alive():
+                return
+            for username, (recorded_path, processed_path) in paths.items():
+                if not self._is_user_recording(username):
+                    self.prune_old_files(recorded_path)
+                self.prune_old_files(processed_path)
+        self._next_prune_at = now + self.retention_check_interval
+
     def prune_old_files(self, path):
         """Prune old files with better error handling"""
         if self.prune_after_days <= 0:
@@ -553,13 +576,17 @@ class TwitchRecorder:
             
         try:
             now = datetime.datetime.now()
-            for filepath in Path(path).glob('*'):
-                if filepath.is_file():
+            for filepath in Path(path).glob('*.mp4'):
+                if filepath.is_file() and not Path(str(filepath) + '.upload-pending').exists():
                     file_modified_time = datetime.datetime.fromtimestamp(filepath.stat().st_mtime)
                     age_in_days = (now - file_modified_time).days
                     if age_in_days > self.prune_after_days:
                         try:
                             filepath.unlink()
+                            for suffix in ('.compressed', '.attempts'):
+                                sidecar = Path(str(filepath) + suffix)
+                                if sidecar.exists():
+                                    sidecar.unlink()
                             logging.info(f"Deleted old file: {filepath}")
                         except Exception as e:
                             logging.error(f"Failed to delete {filepath}: {e}")
@@ -586,14 +613,16 @@ class TwitchRecorder:
         """Process a single recorded file with proper error handling"""
         try:
             # Wait a moment to ensure file is not being written to
-            time.sleep(3)
+            if self._shutdown_event.wait(3):
+                return
             
             # Check if file is still being written (multiple size checks)
             sizes = []
             for i in range(3):
                 sizes.append(os.path.getsize(recorded_filename))
                 if i < 2:  # Don't sleep after last check
-                    time.sleep(2)
+                    if self._shutdown_event.wait(2):
+                        return
             
             # If file size is still changing, it's being written to
             if len(set(sizes)) > 1:
@@ -608,9 +637,12 @@ class TwitchRecorder:
                 logging.warning(f"File {recorded_filename} is locked or inaccessible: {e}")
                 return
             
+            self._check_processing_idle()
             if self.disable_ffmpeg:
+                if self.upload_to_network_drive_enabled:
+                    Path(processed_filename + '.upload-pending').touch()
                 logging.info(f"Moving: {recorded_filename}")
-                shutil.move(recorded_filename, processed_filename)
+                self._move_recording(recorded_filename, processed_filename)
                 self._clear_processing_attempts(recorded_filename)
             else:
                 # Double check we're still idle before starting ffmpeg
@@ -634,6 +666,8 @@ class TwitchRecorder:
             if self.upload_to_network_drive_enabled:
                 self.upload_to_network_drive(processed_filename)
                 
+        except ProcessingInterrupted:
+            logging.info(f"Processing postponed: {recorded_filename}")
         except Exception as e:
             logging.error(f"Error processing file {recorded_filename}: {e}")
             if os.path.exists(recorded_filename):
@@ -696,8 +730,94 @@ class TwitchRecorder:
             except Exception as e:
                 logging.error(f"Failed to quarantine recording {recorded_filename}: {e}")
 
+    def _check_processing_idle(self):
+        if self._shutdown_event.is_set() or self.active_recordings > 0:
+            raise ProcessingInterrupted()
+
+    def _move_recording(self, source, destination):
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as e:
+            if e.errno != errno.EXDEV:
+                raise
+        temp_output = self._temporary_output(destination)
+        try:
+            with open(source, 'rb') as src, open(temp_output, 'wb') as dst:
+                while True:
+                    self._check_processing_idle()
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+            if os.path.getsize(source) != os.path.getsize(temp_output):
+                raise OSError('Recording copy size verification failed')
+            shutil.copystat(source, temp_output)
+            self._check_processing_idle()
+            os.replace(temp_output, destination)
+            os.remove(source)
+        finally:
+            if os.path.exists(temp_output):
+                os.remove(temp_output)
+
+    def _temporary_output(self, destination):
+        fd, path = tempfile.mkstemp(prefix='.twitch-recorder-',
+                                    suffix='.tmp.mp4', dir=str(Path(destination).parent))
+        os.close(fd)
+        return path
+
+    def _run_background_ffmpeg(self, command, timeout):
+        """Run bounded background work, reaping the child on cancellation or timeout."""
+        self._check_processing_idle()
+        process = None
+        self._processing_active.set()
+        try:
+            # Keep verbose FFmpeg output off the heap for multi-hour recordings.
+            with tempfile.TemporaryFile(mode='w+b') as stderr:
+                process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=stderr)
+                try:
+                    if os.name == 'posix':
+                        psutil.Process(process.pid).nice(10)
+                except (psutil.Error, OSError):
+                    pass
+                deadline = time.monotonic() + timeout
+                try:
+                    while process.poll() is None:
+                        self._check_processing_idle()
+                        if time.monotonic() >= deadline:
+                            raise subprocess.TimeoutExpired(command, timeout)
+                        self._shutdown_event.wait(0.5)
+                    self._check_processing_idle()
+                    stderr.seek(0, os.SEEK_END)
+                    stderr.seek(max(0, stderr.tell() - 16384))
+                    return subprocess.CompletedProcess(command, process.returncode, '',
+                                                       stderr.read().decode(errors='replace'))
+                finally:
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+        finally:
+            self._processing_active.clear()
+
+    def _valid_media_output(self, filename, source=None):
+        if not os.path.isfile(filename) or os.path.getsize(filename) == 0:
+            return False
+        duration = self._probe_media_duration_seconds(filename)
+        if not duration:
+            return False
+        source_duration = self._probe_media_duration_seconds(source) if source else None
+        # Reject truncated but readable outputs before deleting/replacing the original.
+        return not source_duration or duration >= source_duration - max(2, source_duration * 0.02)
+
     def ffmpeg_copy_and_fix_errors(self, recorded_filename, processed_filename):
         """Remux recorded stream into a proper MP4 container (stream copy, no re-encoding)."""
+        temp_output = None
         try:
             file_size_gb = os.path.getsize(recorded_filename) / (1024**3)
             timeout_seconds = self._calculate_ffmpeg_timeout(recorded_filename, file_size_gb)
@@ -706,29 +826,43 @@ class TwitchRecorder:
             
             # Stream copy: remux MPEG-TS into proper MP4 container without re-encoding
             # This is fast, preserves original quality, and produces player-compatible files
-            result = subprocess.run([
+            temp_output = self._temporary_output(processed_filename)
+            result = self._run_background_ffmpeg([
                 self.ffmpeg_path, 
+                "-nostdin", "-nostats", "-loglevel", "warning",
                 "-err_detect", "ignore_err",
                 "-i", recorded_filename,
                 "-c", "copy",                # Copy all streams without re-encoding
                 "-movflags", "+faststart",   # Optimize for streaming/seeking
                 "-y",                        # Overwrite output file
-                processed_filename
-            ], capture_output=True, text=True, timeout=timeout_seconds)
+                temp_output
+            ], timeout_seconds)
 
             if result.returncode != 0:
                 logging.error(f"FFmpeg failed for {recorded_filename}")
                 logging.error(f"FFmpeg stderr: {result.stderr}")
                 logging.error(f"FFmpeg stdout: {result.stdout}")
                 return False
+            if not self._valid_media_output(temp_output, recorded_filename):
+                logging.error(f"Invalid or truncated remux output for {recorded_filename}")
+                return False
+            self._check_processing_idle()
+            if self.upload_to_network_drive_enabled:
+                Path(processed_filename + '.upload-pending').touch()
+            os.replace(temp_output, processed_filename)
             logging.info(f"Successfully processed: {recorded_filename}")
             return True
         except subprocess.TimeoutExpired:
             logging.error(f"FFmpeg timeout ({timeout_seconds}s) processing {recorded_filename}")
             return False
+        except ProcessingInterrupted:
+            raise
         except Exception as e:
             logging.error(f"FFmpeg error: {e}")
             return False
+        finally:
+            if temp_output and os.path.exists(temp_output):
+                os.remove(temp_output)
 
     def compress_processed_file(self, processed_path):
         """Compress ONE processed file per call using H.264 re-encoding to save space.
@@ -736,10 +870,13 @@ class TwitchRecorder:
         Skips files that have already been compressed (marked with .compressed marker).
         Only runs when the system is idle (no active recordings).
         """
+        temp_output = None
         try:
             video_files = [f for f in os.listdir(processed_path)
                           if os.path.isfile(os.path.join(processed_path, f))
                           and f.endswith('.mp4')
+                          and not f.startswith('.')
+                          and not os.path.exists(os.path.join(processed_path, f + '.upload-pending'))
                           and not os.path.exists(os.path.join(processed_path, f + '.compressed'))]
             
             if not video_files:
@@ -747,7 +884,6 @@ class TwitchRecorder:
             
             filename = video_files[0]
             source = os.path.join(processed_path, filename)
-            temp_output = source + '.compressing'
             marker = source + '.compressed'
             
             file_size_gb = os.path.getsize(source) / (1024**3)
@@ -760,18 +896,23 @@ class TwitchRecorder:
                 logging.info("Recording started, postponing idle compression")
                 return
             
-            result = subprocess.run([
+            temp_output = self._temporary_output(source)
+            result = self._run_background_ffmpeg([
                 self.ffmpeg_path,
+                "-nostdin", "-nostats", "-loglevel", "warning",
+                "-threads", str(self.processing_threads),
                 "-i", source,
                 "-c:v", "libx264",
                 "-crf", str(self.idle_compress_crf),
                 "-preset", self.idle_compress_preset,
+                "-threads", str(self.processing_threads),
+                "-filter_threads", "1",
                 "-c:a", "aac",
                 "-b:a", self.idle_compress_audio_bitrate,
                 "-movflags", "+faststart",
                 "-y",
                 temp_output
-            ], capture_output=True, text=True, timeout=timeout_seconds)
+            ], timeout_seconds)
             
             if result.returncode != 0:
                 logging.error(f"Idle compress failed for {filename}: {result.stderr}")
@@ -780,7 +921,8 @@ class TwitchRecorder:
                 return
             
             # Verify compressed file is valid and smaller
-            if os.path.exists(temp_output) and os.path.getsize(temp_output) > 0:
+            if self._valid_media_output(temp_output, source):
+                self._check_processing_idle()
                 original_size = os.path.getsize(source)
                 compressed_size = os.path.getsize(temp_output)
                 savings = (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
@@ -801,18 +943,21 @@ class TwitchRecorder:
                 if os.path.exists(temp_output):
                     os.remove(temp_output)
                     
+        except ProcessingInterrupted:
+            logging.info(f"Idle compression postponed for {processed_path}")
         except subprocess.TimeoutExpired:
             logging.error(f"Idle compress timeout for {processed_path}")
-            if os.path.exists(temp_output):
-                os.remove(temp_output)
         except Exception as e:
             logging.error(f"Idle compress error: {e}")
+        finally:
+            if temp_output and os.path.exists(temp_output):
+                os.remove(temp_output)
 
     def _probe_media_duration_seconds(self, filename):
         """Get media duration in seconds using ffprobe when available."""
         try:
             result = subprocess.run([
-                "ffprobe",
+                str(Path(self.ffmpeg_path).with_name('ffprobe')),
                 "-v", "error",
                 "-show_entries", "format=duration",
                 "-of", "default=noprint_wrappers=1:nokey=1",
@@ -858,8 +1003,8 @@ class TwitchRecorder:
             
             if response.status_code == 401:
                 # Try refreshing token once
-                self.fetch_access_token()
-                headers["Authorization"] = f"Bearer {self.access_token}"
+                rejected_token = headers["Authorization"][7:]
+                headers["Authorization"] = f"Bearer {self.fetch_access_token(rejected_token=rejected_token)}"
                 response = requests.get(f"{self.url}?user_login={username}", headers=headers, timeout=15)
             
             response.raise_for_status()
@@ -872,43 +1017,63 @@ class TwitchRecorder:
             
         except requests.exceptions.RequestException as e:
             logging.error(f"Error checking user {username}: {e}")
-            if hasattr(e, 'response') and e.response:
+            if getattr(e, 'response', None) is not None:
                 if e.response.status_code == 401:
                     return TwitchResponseStatus.UNAUTHORIZED, None
                 elif e.response.status_code == 404:
                     return TwitchResponseStatus.NOT_FOUND, None
             return TwitchResponseStatus.ERROR, None
 
-    def upload_to_network_drive(self, processed_filename):
-        """Upload to network drive with verification"""
-        if not self.network_drive_path:
+    def _retry_pending_uploads(self, processed_path):
+        if not self.upload_to_network_drive_enabled:
             return
-            
+        for marker in sorted(Path(processed_path).glob('*.upload-pending')):
+            if self._shutdown_event.is_set() or self.active_recordings > 0:
+                return
+            source = str(marker)[:-len('.upload-pending')]
+            if os.path.isfile(source):
+                self.upload_to_network_drive(source)
+
+    def upload_to_network_drive(self, processed_filename):
+        """Publish a complete copy atomically; retain a durable marker until successful."""
+        temp_output = None
+        marker = Path(processed_filename + '.upload-pending')
         try:
-            filename = os.path.basename(processed_filename)
-            destination = os.path.join(self.network_drive_path, filename)
-            
-            # Ensure destination directory exists
-            dest_dir = os.path.dirname(destination)
-            if dest_dir:  # Only create if there's actually a directory component
-                os.makedirs(dest_dir, exist_ok=True)
-            
-            # Copy file
-            shutil.copy2(processed_filename, destination)
-            
-            # Verify upload
-            if os.path.exists(destination):
-                src_size = os.path.getsize(processed_filename)
-                dst_size = os.path.getsize(destination)
-                if src_size == dst_size:
-                    logging.info(f"Successfully uploaded: {destination}")
-                else:
-                    logging.error(f"Upload verification failed: size mismatch for {destination}")
-            else:
-                logging.error(f"Upload failed: {destination} not found after copy")
-                
+            marker.touch()
+            if not self.network_drive_path:
+                logging.error("Network upload enabled but network_drive_path is empty")
+                return False
+            self._check_processing_idle()
+            os.makedirs(self.network_drive_path, exist_ok=True)
+            destination = os.path.join(self.network_drive_path, os.path.basename(processed_filename))
+            fd, temp_output = tempfile.mkstemp(prefix='.twitch-recorder-',
+                                              suffix='.uploading', dir=self.network_drive_path)
+            with os.fdopen(fd, 'wb') as target, open(processed_filename, 'rb') as source:
+                while True:
+                    self._check_processing_idle()
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    target.write(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+            if os.path.getsize(temp_output) != os.path.getsize(processed_filename):
+                raise OSError("Upload size verification failed")
+            shutil.copystat(processed_filename, temp_output)
+            self._check_processing_idle()
+            os.replace(temp_output, destination)
+            marker.unlink()
+            logging.info(f"Successfully uploaded: {destination}")
+            return True
+        except ProcessingInterrupted:
+            logging.info(f"Upload postponed: {processed_filename}")
+            return False
         except Exception as e:
             logging.error(f"Failed to upload to network drive: {e}")
+            return False
+        finally:
+            if temp_output and os.path.exists(temp_output):
+                os.remove(temp_output)
 
     def record_stream(self, username, info, recorded_path, processed_path):
         """Record a stream with proper process management"""
@@ -981,7 +1146,8 @@ class TwitchRecorder:
         try:
             # Maximum recording time: 12 hours (configurable safety limit)
             max_recording_time = 12 * 3600
-            start_time = time.time()
+            start_time = time.monotonic()
+            last_growth_at = start_time
             
             with tqdm(total=0, unit='B', unit_scale=True, desc=display_name[:50], ncols=100) as pbar:
                 last_size = 0
@@ -990,7 +1156,7 @@ class TwitchRecorder:
                 
                 while process.poll() is None:
                     # Check for overall timeout
-                    if time.time() - start_time > max_recording_time:
+                    if time.monotonic() - start_time > max_recording_time:
                         logging.warning(f"Recording timeout ({max_recording_time}s) reached for {display_name}")
                         process.terminate()
                         break
@@ -1008,6 +1174,7 @@ class TwitchRecorder:
                                 pbar.n = current_size
                                 pbar.refresh()
                                 last_size = current_size
+                                last_growth_at = time.monotonic()
                                 stalled_count = 0
                                 file_check_failures = 0
                             else:
@@ -1023,7 +1190,11 @@ class TwitchRecorder:
                     except OSError as e:
                         logging.error(f"Error checking file size for {display_name}: {e}")
                     
-                    time.sleep(5)
+                    if time.monotonic() - last_growth_at >= self.recording_stall_timeout:
+                        logging.warning(f"Recording stalled for {display_name}; stopping so polling can retry")
+                        process.terminate()
+                        break
+                    self._shutdown_event.wait(5)
                 
                 # Final update
                 try:
@@ -1062,11 +1233,11 @@ def main(argv):
     
     try:
         twitch_recorder = TwitchRecorder()
-    except SystemExit:
-        return
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 1
     except Exception as e:
         logging.error(f"Failed to initialize TwitchRecorder: {e}")
-        return
+        return 1
 
     usage_message = "twitch-recorder.py -u <usernames> -q <quality>"
 
@@ -1102,8 +1273,10 @@ def main(argv):
         logging.info("Interrupted by user")
     except Exception as e:
         logging.error(f"Unexpected error: {e}")
+        return 1
     finally:
         logging.info("Application terminated")
+    return 0
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    sys.exit(main(sys.argv[1:]))

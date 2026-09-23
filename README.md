@@ -54,7 +54,7 @@ twitch-stream-recorder/
    pip install -r requirements.txt
    ```
 
-3. (Optional) Download FFmpeg from [FFmpeg.org](https://ffmpeg.org/download.html) and add the binary to your system's PATH.
+3. For video processing, install FFmpeg and FFprobe from [FFmpeg.org](https://ffmpeg.org/download.html) and add both binaries to your system's PATH.
 
 ## Configuration
 
@@ -77,6 +77,9 @@ Edit `config/config.json`:
 - `prune_after_days`: Days after which to delete old files.
 - `upload_to_network_drive`: Enable uploading to network drive (true/false).
 - `network_drive_path`: Path for network drive uploads.
+
+See [the configuration guide](docs/CONFIGURATION.md#recording-and-background-processing)
+for stall recovery, periodic retention, processing limits, and upload retries.
 
 ## Usage
 
@@ -130,6 +133,18 @@ sudo bash install.sh
 ```
 
 See [docs/SYSTEMD_SETUP.md](docs/SYSTEMD_SETUP.md) for details.
+
+## Tests
+
+Install the development requirements and run the regression suite:
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest -q
+```
+
+The FFmpeg integration test uses a generated video and runs when FFmpeg and
+FFprobe are installed. Tests do not access Twitch or start Docker containers.
 
 ## License
 

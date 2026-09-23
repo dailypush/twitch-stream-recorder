@@ -57,9 +57,15 @@ def make_recorder(max_concurrent_recordings=2):
     recorder._recording_slots = threading.BoundedSemaphore(max_concurrent_recordings)
     recorder._idle_processing_thread = None
     recorder._idle_processing_lock = threading.Lock()
+    recorder._processing_active = threading.Event()
     recorder._shutdown_event = threading.Event()
     recorder.disable_ffmpeg = False
     recorder.idle_compress_enabled = True
+    recorder.processing_threads = 1
+    recorder.recording_stall_timeout = 300
+    recorder.retention_check_interval = 3600
+    recorder._next_prune_at = 0
+    recorder.upload_to_network_drive_enabled = False
     recorder.usernames = []
     return recorder
 
