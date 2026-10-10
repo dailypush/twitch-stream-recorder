@@ -12,9 +12,9 @@ twitch-stream-recorder/
 │   ├── config.json             # Your configuration (gitignored)
 │   └── config.example.json     # Example configuration template
 ├── scripts/
-│   ├── dashboard-live.sh       # Real-time monitoring dashboard
-│   ├── dashboard.sh            # Standard monitoring dashboard
-│   ├── dashboard-watch.sh      # Auto-refreshing dashboard
+│   ├── dashboard-live.sh       # Compatibility launcher for the unified TUI
+│   ├── dashboard.sh            # Unified recorder TUI
+│   ├── dashboard-watch.sh      # Compatibility launcher with refresh option
 │   ├── validate-recordings.sh  # MP4 integrity checker
 │   └── process-recordings.sh   # Batch processing script
 ├── systemd/
@@ -108,18 +108,20 @@ python twitch_recorder.py -l DEBUG
 
 ## Monitoring Dashboard
 
-Use the live dashboard to monitor recordings:
+Use the consolidated TUI for recording history, live processing, logs and system health:
 
 ```bash
-# Real-time dashboard with in-place updates
-./scripts/dashboard-live.sh
-
-# Standard dashboard
 ./scripts/dashboard.sh
-
-# Auto-refreshing every 10 seconds
-./scripts/dashboard-watch.sh
+# On the Pi after SSH login:
+dashboard
+# One-time status without an interactive terminal:
+./scripts/dashboard.sh --once
 ```
+
+Switch views with **1–4** or **Tab**. Search files with **/**, filter by channel
+with **c** or stage with **g**, and open details with **Enter**. Press **?** for
+shortcuts and **q** to exit. The former live and watch scripts launch the same TUI.
+It makes no Twitch API calls and caches file scans to limit Pi disk activity.
 
 See [docs/MONITORING.md](docs/MONITORING.md) for details.
 
