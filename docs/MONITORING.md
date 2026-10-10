@@ -42,6 +42,13 @@ fresh and matching the current recorder PID. It falls back to processes, logs an
 cached scans if telemetry is missing, stale or from a previous service instance.
 This dashboard makes no Twitch API requests.
 
+EventSub allows five seconds of arrival grace beyond Twitch's negotiated keepalive
+timeout (normally 30 seconds), to avoid reconnecting for minor network or Pi
+scheduling delays. Longer silence triggers a reconnect and enables fallback
+polling at the configured interval. Timeout logs include the measured silence and
+deadline. A successful reconnect checks for broadcasts missed during the outage;
+routine polling stays suspended while EventSub is connected.
+
 FFmpeg progress is read continuously from its progress pipe with bounded memory.
 Percent and approximate ETA use actual media time and cached source duration;
 unknown durations show bytes written without an invented percentage. Media

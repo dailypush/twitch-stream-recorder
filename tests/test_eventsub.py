@@ -194,6 +194,76 @@ def test_server_migration_preserves_subscriptions(monkeypatch, tmp_path):
     assert len(calls) == 2
 
 
+def test_late_keepalive_within_grace_does_not_reconnect(monkeypatch, tmp_path):
+    client = listener(tmp_path)
+    client.token.get = Mock(return_value='user-token')
+    client.broadcasters = {'pyka': '123'}
+    client.subscribe = Mock()
+    clock = [0]
+    monkeypatch.setattr(eventsub.time, 'monotonic', lambda: clock[0])
+    welcome = json.dumps(dict(metadata=dict(message_type='session_welcome'),
+                              payload=dict(session=dict(id='session', keepalive_timeout_seconds=30))))
+    class Socket:
+        calls = 0
+        def settimeout(self, seconds):
+            assert seconds == 1  # Shutdown remains responsive during quiet periods.
+        def recv(self):
+            self.calls += 1
+            if self.calls == 1:
+                return welcome
+            if self.calls == 2:
+                clock[0] = 30.16
+                raise TimeoutError()
+            clock[0] = 32
+            client.shutdown.set()
+            return json.dumps(dict(metadata=dict(message_type='session_keepalive'), payload={}))
+        def close(self):
+            pass
+    connect = Mock(return_value=Socket())
+    monkeypatch.setitem(sys.modules, 'websocket', SimpleNamespace(create_connection=connect,
+                        WebSocketTimeoutException=TimeoutError))
+    client.run()
+    assert connect.call_count == 1
+    assert client.failure_count == 0
+    client.subscribe.assert_called_once_with('session')
+
+
+def test_silent_connection_expires_after_negotiated_timeout_and_grace(monkeypatch, tmp_path):
+    client = listener(tmp_path)
+    client.token.get = Mock(return_value='user-token')
+    client.broadcasters = {'pyka': '123'}
+    client.subscribe = Mock()
+    clock = [0]
+    monkeypatch.setattr(eventsub.time, 'monotonic', lambda: clock[0])
+    welcome = json.dumps(dict(metadata=dict(message_type='session_welcome'),
+                              payload=dict(session=dict(id='session', keepalive_timeout_seconds=10))))
+    class Socket:
+        calls = 0
+        def settimeout(self, seconds):
+            pass
+        def recv(self):
+            self.calls += 1
+            if self.calls == 1:
+                return welcome
+            clock[0] = 16
+            raise TimeoutError()
+        def close(self):
+            pass
+    def wait(timeout):
+        assert not client.connected.is_set()  # Enables the existing outage polling.
+        client.shutdown.set()
+        return True
+    monkeypatch.setattr(client.shutdown, 'wait', wait)
+    connect = Mock(return_value=Socket())
+    monkeypatch.setitem(sys.modules, 'websocket', SimpleNamespace(create_connection=connect,
+                        WebSocketTimeoutException=TimeoutError))
+    client.run()
+    assert connect.call_count == 1
+    assert client.failure_count == 1
+    assert 'no message for 16.0s' in client.last_error
+    assert 'Twitch timeout 10s + 5s grace' in client.last_error
+
+
 def test_device_login_requests_no_scopes_and_saves_private_tokens(monkeypatch, tmp_path, capsys):
     spec = importlib.util.spec_from_file_location('authorize_eventsub',
         Path(__file__).resolve().parents[1] / 'scripts' / 'authorize-eventsub.py')

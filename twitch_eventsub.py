@@ -14,6 +14,9 @@ import requests
 API = 'https://api.twitch.tv/helix'
 IDENTITY = 'https://id.twitch.tv/oauth2'
 SOCKET_URL = 'wss://eventsub.wss.twitch.tv/ws?keepalive_timeout_seconds=30'
+# Arrival can lag Twitch's send deadline due to network and Pi scheduling jitter.
+# Keep this bounded so a genuinely silent connection still switches to polling.
+KEEPALIVE_GRACE_SECONDS = 5
 
 
 def save_tokens(path, tokens):
@@ -176,18 +179,23 @@ class EventSubListener(threading.Thread):
                 socket = websocket.create_connection(SOCKET_URL, timeout=15)
                 socket.settimeout(1)
                 keepalive = 30
-                deadline = time.monotonic() + 30
+                received_at = time.monotonic()
+                deadline = received_at + keepalive + KEEPALIVE_GRACE_SECONDS
                 while not self.shutdown.is_set():
                     try:
                         raw = socket.recv()
                     except websocket.WebSocketTimeoutException:
                         self.token.get()  # Refresh and validate even during quiet periods.
                         if time.monotonic() >= deadline:
-                            raise RuntimeError('EventSub keepalive expired')
+                            raise RuntimeError('EventSub keepalive expired: no message for %.1fs '
+                                               '(Twitch timeout %ss + %ss grace)' % (
+                                                   time.monotonic() - received_at, keepalive,
+                                                   KEEPALIVE_GRACE_SECONDS))
                         continue
                     if not raw:
                         raise RuntimeError('EventSub connection closed')
                     message = json.loads(raw)
+                    received_at = time.monotonic()
                     kind = message['metadata']['message_type']
                     self.last_message_at = time.time()
                     if kind == 'session_welcome':
@@ -223,13 +231,14 @@ class EventSubListener(threading.Thread):
                         keepalive = welcome['payload']['session'].get('keepalive_timeout_seconds') or 30
                         self.keepalive_seconds = keepalive
                         self.last_message_at = time.time()
+                        received_at = time.monotonic()
                         logging.info('EventSub connection migrated')
                         for username in sorted(self.usernames):
                             self.on_online(username)
                     elif kind == 'revocation':
                         self.broadcasters = None
                         raise RuntimeError('EventSub subscription revoked; polling remains active')
-                    deadline = time.monotonic() + keepalive
+                    deadline = received_at + keepalive + KEEPALIVE_GRACE_SECONDS
             except Exception as exc:
                 self.connected.clear()
                 self.failure_count += 1
