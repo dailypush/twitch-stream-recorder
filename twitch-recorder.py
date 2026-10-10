@@ -137,7 +137,8 @@ class TwitchRecorder:
         """Validate required external dependencies"""
         # Check streamlink
         try:
-            result = subprocess.run(['streamlink', '--version'], capture_output=True, timeout=5)
+            # Python/plugin imports can take 15 seconds on a busy Pi Zero W.
+            result = subprocess.run(['streamlink', '--version'], capture_output=True, timeout=30)
             if result.returncode != 0:
                 logging.warning("Streamlink not found or not working properly")
         except FileNotFoundError:
