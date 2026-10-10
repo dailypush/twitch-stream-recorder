@@ -62,6 +62,11 @@ class TwitchRecorder:
         self.processing_threads = max(1, config_data.get("processing_threads", 1))
         self.stitch_recordings_enabled = config_data.get("stitch_recordings_enabled", True)
         self.stitch_max_gap_seconds = max(0, config_data.get("stitch_max_gap_seconds", 900))
+        self.eventsub_enabled = config_data.get('eventsub_enabled', False)
+        self.eventsub_token_path = config_data.get('eventsub_token_path', 'config/eventsub-token.json')
+        self._eventsub_listener = None
+        self._eventsub_recovery_users = set()
+        self._eventsub_recovery_lock = threading.Lock()
         self.recording_stall_timeout = max(30, config_data.get("recording_stall_timeout_seconds", 300))
         self.retention_check_interval = max(60, config_data.get("retention_check_interval_seconds", 3600))
         self._next_prune_at = 0
@@ -439,12 +444,15 @@ class TwitchRecorder:
         # Use ThreadPoolExecutor for concurrent recording checks
         self._executor = ThreadPoolExecutor(max_workers=min(len(self.usernames), 5))
         try:
+            self._start_eventsub(paths)
             while not self._shutdown_event.is_set():
                 self._prune_if_due(paths)
                 # Submit tasks for each username
                 future_to_username = {}
                 current_time = time.time()
                 for username in self.usernames:
+                    if not self._should_poll_user(username):
+                        continue
                     if not self._should_check_user_now(username, current_time):
                         continue
                     recorded_path, processed_path = paths[username]
@@ -480,6 +488,9 @@ class TwitchRecorder:
                     break
         finally:
             self._shutdown_event.set()
+            listener = getattr(self, '_eventsub_listener', None)
+            if listener:
+                listener.join(timeout=20)
             # Graceful shutdown of executor
             logging.info("Shutting down executor...")
             if self._executor:
@@ -487,6 +498,44 @@ class TwitchRecorder:
                 self._executor.shutdown(wait=False)
             logging.info("Cleaning up processes...")
             self._cleanup_processes()  # This already handles process termination properly
+
+    def _start_eventsub(self, paths):
+        if not getattr(self, 'eventsub_enabled', False):
+            return
+        from twitch_eventsub import EventSubListener
+
+        def online(username):
+            if self._shutdown_event.is_set() or username not in paths:
+                return
+            self._reset_user_backoff(username)
+            with self._eventsub_recovery_lock:
+                self._eventsub_recovery_users.add(username)
+            # Run API checks outside the socket thread; existing reservations prevent duplicates.
+            self._executor.submit(self._check_eventsub_user, username, *paths[username])
+
+        self._eventsub_listener = EventSubListener(
+            self.client_id, self.client_secret, self.eventsub_token_path,
+            self.usernames, online, self._shutdown_event)
+        self._eventsub_listener.start()
+
+    def _check_eventsub_user(self, username, recorded_path, processed_path):
+        status = self.check_and_record_user(username, recorded_path, processed_path)
+        self._update_user_check_schedule(username, status)
+        return status
+
+    def _should_poll_user(self, username):
+        """Healthy EventSub replaces routine polling; failed recordings still recover."""
+        listener = getattr(self, '_eventsub_listener', None)
+        if not listener or not listener.connected.is_set():
+            return True
+        with self._eventsub_recovery_lock:
+            if username not in self._eventsub_recovery_users:
+                return False
+        if self._is_user_recording(username):
+            with self._eventsub_recovery_lock:
+                self._eventsub_recovery_users.discard(username)
+            return False
+        return True
 
     def check_and_record_user(self, username, recorded_path, processed_path):
         """Check and potentially record a single user"""
@@ -531,6 +580,10 @@ class TwitchRecorder:
             self._next_user_check_at[username] = 0
 
     def _update_user_check_schedule(self, username, status):
+        if status in (TwitchResponseStatus.OFFLINE, TwitchResponseStatus.NOT_FOUND):
+            if hasattr(self, '_eventsub_recovery_lock'):
+                with self._eventsub_recovery_lock:
+                    self._eventsub_recovery_users.discard(username)
         if not self.offline_backoff_enabled:
             return
 
@@ -1305,6 +1358,12 @@ class TwitchRecorder:
                 except OSError as exc:
                     logging.warning(f'Could not save recording session metadata: {exc}')
             self._release_recording_reservation(username)
+
+            # A Streamlink exit does not generate another Twitch online event.
+            if getattr(self, 'eventsub_enabled', False) and not self._shutdown_event.is_set():
+                with self._eventsub_recovery_lock:
+                    self._eventsub_recovery_users.add(username)
+                self._reset_user_backoff(username)
 
     def _monitor_recording(self, process, filename, display_name):
         """Monitor recording process with better progress display and timeout"""

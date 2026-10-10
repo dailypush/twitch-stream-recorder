@@ -2,6 +2,49 @@
 
 ## Recording and background processing
 
+### EventSub notifications with backup polling
+
+Set `eventsub_enabled` to `true` to receive Twitch `stream.online` and
+`stream.offline` notifications over one outgoing WebSocket. Keep
+`refresh_interval` at your preferred backup polling interval (for example, 400
+seconds). Routine polling runs only while EventSub is unavailable. Existing
+offline backoff still applies to fallback polling. Notifications bypass
+the polling schedule and request an immediate recording check. Duplicate events
+and concurrent polling use the existing per-channel recording reservation.
+
+Install the requirements, then run this from the project directory:
+
+```bash
+python3 scripts/authorize-eventsub.py
+```
+
+Open the printed Twitch activation link and enter the code using your own Twitch
+account. No permission scopes are requested for stream-status events. Pyka does
+not need to authorize the recorder. This uses Twitch's device code flow and saves
+the user access/refresh tokens in `config/eventsub-token.json` with private file
+permissions. Do not commit or share that file. A custom path can be set with
+`eventsub_token_path`. `--begin` requests a code without waiting; `--wait` continues
+that request, so code generation and browser authorization can be separated.
+
+Restart the recorder after enabling EventSub. The listener validates user tokens
+on connection and hourly, refreshes expiring tokens, reconnects with backoff, and
+recreates subscriptions after connection loss. It checks live status after
+connecting or migrating so broadcasts already live or missed during downtime can
+be recovered. Missing authorization, disconnected sockets, and revoked
+subscriptions leave backup polling active. Offline notifications do not kill
+Streamlink; it can drain buffered footage normally. An interrupted recording of
+an ongoing broadcast triggers a targeted recovery check on the existing interval,
+even when EventSub is healthy: a Streamlink exit does not generate another online
+event. Channels that could not start recording also retry until recording starts
+or an offline response is received. Active recordings and idle offline channels
+are not routinely polled while EventSub is connected.
+
+The Python 3.7 Pi uses `websocket-client==1.6.1`; newer Python environments let pip
+select a compatible release. WebSocket libraries handle protocol ping/pong;
+Twitch keepalive messages are received without making status API requests.
+
+### Processing options
+
 Set these options in `config/config.json`:
 
 | Option | Default | Behavior |

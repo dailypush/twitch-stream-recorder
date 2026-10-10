@@ -67,6 +67,8 @@ def make_recorder(max_concurrent_recordings=2):
     recorder._next_prune_at = 0
     recorder.upload_to_network_drive_enabled = False
     recorder.usernames = []
+    recorder._eventsub_recovery_users = set()
+    recorder._eventsub_recovery_lock = threading.Lock()
     return recorder
 
 

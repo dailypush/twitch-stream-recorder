@@ -2,6 +2,8 @@
     "ffmpeg_path": "path/to/ffmpeg",
     "disable_ffmpeg": false,
     "refresh_interval": 15,
+    "eventsub_enabled": false,
+    "eventsub_token_path": "config/eventsub-token.json",
     "offline_backoff_enabled": true,
     "offline_backoff_base_seconds": 60,
     "offline_backoff_max_seconds": 600,
