@@ -57,6 +57,24 @@ space estimates are conservative and show the next task's temporary output needs
 Alerts highlight stale heartbeats, stalled output/media progress, notification
 reconnect failures, low disk/RAM and quarantined recordings.
 
+Idle compression pauses the existing FFmpeg process when any recording reserves
+a slot, preserving its current encoding progress and temporary output. Once
+recordings finish, newly captured footage is remuxed and eligible parts are
+stitched before that same encoder resumes. The Overview phase and Queue show
+paused compression; expected pauses do not raise stalled-output alerts. ETA uses
+active encoding time, excluding recording pauses.
+
+Compression has no fixed total runtime limit: it can use idle periods lasting
+days. `idle_compress_stall_timeout_seconds` defaults to 1800 (30 minutes) and
+stops an encoder only when frames, media time and output bytes all stop advancing
+while it is running. Paused time is excluded, and resuming starts a fresh watchdog
+window. Remuxing and stitching retain their existing timeouts.
+
+Pause/resume keeps the encoder's state in memory and retains its RAM allocation.
+A recorder service restart, crash or Pi reboot restarts the unfinished file from
+the beginning. The original recording is replaced only after the complete output
+passes duration validation and is smaller; incomplete output is never published.
+
 Broadcasts group by session ID, explicit stitched-part manifests, or matching
 legacy titles and measured time gaps. Grouping is for browsing; the recorder still
 checks timing and codec compatibility before stitching. Queue entries describe

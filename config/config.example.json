@@ -24,5 +24,6 @@
     "idle_compress_enabled": true,
     "idle_compress_crf": 28,
     "idle_compress_preset": "medium",
-    "idle_compress_audio_bitrate": "128k"
+    "idle_compress_audio_bitrate": "128k",
+    "idle_compress_stall_timeout_seconds": 1800
 }

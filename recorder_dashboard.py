@@ -283,7 +283,10 @@ class Collector:
                 jobs.append(dict(pid=info['pid'], kind=kind, channel=channel or '--',
                     source=source, output=output, size=size, rate=rate, elapsed=now-info['create_time'],
                     inputs=inputs, no_growth=now-last_growth,
+                    paused=process.status()==psutil.STATUS_STOPPED,
                     cpu=process.cpu_percent(), memory=process.memory_info().rss))
+                if jobs[-1]['paused']:
+                    jobs[-1]['phase'] = 'Paused for recording / new footage'
             except (psutil.Error, OSError, ValueError):
                 continue
         self.previous_sizes = current
@@ -356,7 +359,7 @@ class Collector:
             alerts.append('Repeated EventSub failures in the last 15 minutes: %s' % recent_failures)
         for job in jobs:
             if job.get('no_growth',0)>=self.config.get('recording_stall_timeout_seconds',300) and (
-                    job.get('phase')!='Finalizing / validating' and now-job.get('progress_at',now-job.get('no_growth',0))>=300):
+                    not job.get('paused') and job.get('phase')!='Finalizing / validating' and now-job.get('progress_at',now-job.get('no_growth',0))>=300):
                 alerts.append('%s %s has no output/media progress for %s' % (job['kind'],job['channel'],elapsed(job['no_growth'])))
         next_work = next((row for row in queue if row.get('required_bytes')),None)
         if next_work and disk.free < next_work['required_bytes']+128*1024*1024:
@@ -469,7 +472,7 @@ class Dashboard:
                           'Written '+human_bytes(job['size'])+'  |  growth '+human_bytes(job['rate'])+'/s  |  CPU %.1f%%' % job['cpu']]
                 if job.get('percent') is not None:
                     progress='Media progress %.1f%% (%s / %s)' % (job['percent'],elapsed(job['media_seconds']),elapsed(job['expected_seconds']))
-                    if job.get('speed') and job['speed']>0 and job['percent']<100:
+                    if not job.get('paused') and job.get('speed') and job['speed']>0 and job['percent']<100:
                         progress+='  |  approx ETA '+elapsed((job['expected_seconds']-job['media_seconds'])/job['speed'])
                     lines.append(progress)
                 if job.get('phase'):

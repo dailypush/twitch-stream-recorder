@@ -235,9 +235,10 @@ def processing_queue(catalog, groups, config, busy=False, jobs=None, now=None):
     rows = []
     def append(row, kind, reason, required=0):
         paths = row.get('inputs', [row.get('path')])
-        state = 'Running' if any(path in active for path in paths) else 'Blocked' if row.get('blocked') else 'Waiting'
+        paused = any(job.get('paused') and any(path in job.get('inputs', []) for path in paths) for job in jobs or [])
+        state = 'Paused' if paused else 'Running' if any(path in active for path in paths) else 'Blocked' if row.get('blocked') else 'Waiting'
         rows.append(dict(kind=kind, channel=row['channel'], title=row['title'], path=paths[0], inputs=paths,
-                         state=state, reason='Active job' if state=='Running' else reason,
+                         state=state, reason='Paused for recording; progress retained' if paused else 'Active job' if state=='Running' else reason,
                          attempts=row.get('attempts',0), required_bytes=required))
     for row in catalog:
         reason = 'Recording has priority' if busy else 'Next idle processing cycle'
@@ -279,7 +280,7 @@ def processing_queue(catalog, groups, config, busy=False, jobs=None, now=None):
                     reason='Incompatible media formats; automatic stitching is blocked';blocked=True
             append(dict(channel=group['channel'],title=group['title'],blocked=blocked,inputs=[part['path'] for part in parts]),
                    'Stitch',reason,sum(part['size'] for part in parts))
-    return sorted(rows,key=lambda row: ({'Running':0}.get(row['state'],1), {'Upload':0,'Remux':1,'Move':1,'Stitch':2,'Compress':3}.get(row['kind'],4)))
+    return sorted(rows,key=lambda row: ({'Running':0,'Paused':0}.get(row['state'],1), {'Upload':0,'Remux':1,'Move':1,'Stitch':2,'Compress':3}.get(row['kind'],4)))
 
 
 class ProgressCapture:
@@ -291,6 +292,14 @@ class ProgressCapture:
         self.command = [command[0], '-progress', 'pipe:1']+list(command[1:])
         self.partial = b''
         self.values = {}
+        self.lock = threading.RLock()
+        self.paused = False
+        self.pause_started = None
+        self.paused_seconds = 0
+        self.started_monotonic = time.monotonic()
+        self.last_advance_at = self.started_monotonic
+        self.last_frame = 0
+        self.last_bytes = 0
         args = list(command)
         source = str(Path(args[args.index('-i')+1]).resolve()) if '-i' in args else None
         self.kind = 'Stitching' if 'concat' in args else 'Compressing' if '-crf' in args else 'Remuxing'
@@ -305,7 +314,7 @@ class ProgressCapture:
                 elif line.startswith('duration '):
                     duration += float(line[9:])
         elif source:
-            data = telemetry.journal.media(source) or {}
+            data = (telemetry.journal.media(source) or {}) if telemetry else {}
             duration = data.get('duration')
         self.job = dict(kind=self.kind, inputs=self.inputs, source=source, output=str(Path(args[-1]).resolve()),
                         expected_seconds=duration, media_seconds=0, percent=None, speed=None, pid=None,
@@ -314,10 +323,12 @@ class ProgressCapture:
     def attach(self, process):
         self.job['pid'] = process.pid
         self.reader = process.stdout
-        self.telemetry.set_job(self.job)
+        if self.telemetry:
+            self.telemetry.set_job(self.job)
         self.thread=threading.Thread(target=self.drain,name='ffmpeg-progress',daemon=True)
         self.thread.start()
-        self.telemetry.event('processing-started',self.kind+': '+', '.join(self.inputs),self.inputs[0] if self.inputs else None)
+        if self.telemetry:
+            self.telemetry.event('processing-started',self.kind+': '+', '.join(self.inputs),self.inputs[0] if self.inputs else None)
 
     def drain(self):
         try:
@@ -327,6 +338,10 @@ class ProgressCapture:
             pass
 
     def accept(self, raw):
+        with self.lock:
+            self._accept(raw)
+
+    def _accept(self, raw):
         key, separator, value = raw.decode(errors='replace').strip().partition('=')
         if separator and len(key)<40 and len(value)<200:
             self.values[key] = value
@@ -348,11 +363,51 @@ class ProgressCapture:
         except ValueError:
             speed=None
         changed = seconds > self.job['media_seconds']
+        now = time.monotonic()
+        try:
+            frames = int(self.values.get('frame', '0'))
+        except ValueError:
+            frames = self.last_frame
+        try:
+            size = int(self.values.get('total_size', '0'))
+        except ValueError:
+            size = self.last_bytes
+        advancing = changed or frames > self.last_frame or size > self.last_bytes
+        if advancing:
+            self.last_advance_at = now
+        self.last_frame = max(self.last_frame, frames)
+        self.last_bytes = max(self.last_bytes, size)
+        active_seconds = now - self.started_monotonic - self.paused_seconds
+        if self.pause_started is not None:
+            active_seconds -= now - self.pause_started
+        if self.kind == 'Compressing' and active_seconds > 0 and speed is not None:
+            speed = seconds / active_seconds if seconds > 0 else None
         self.job.update(media_seconds=seconds,percent=percent,speed=speed,
-                        phase='Finalizing / validating' if value=='end' or (percent is not None and percent>=99.9) else 'Processing')
-        if changed:
+                        active_seconds=max(0, active_seconds), paused=self.paused,
+                        phase='Paused for recording' if self.paused else 'Finalizing / validating' if value=='end' else 'Processing')
+        if advancing:
             self.job['progress_at']=time.time()
-        self.telemetry.set_job(self.job)
+        if self.telemetry:
+            self.telemetry.set_job(self.job)
+
+    def set_paused(self, paused):
+        with self.lock:
+            self._set_paused(paused)
+
+    def _set_paused(self, paused):
+        now = time.monotonic()
+        self.paused = paused
+        if paused and self.pause_started is None:
+            self.pause_started = now
+        elif not paused and self.pause_started is not None:
+            self.paused_seconds += now - self.pause_started
+            self.pause_started = None
+            self.last_advance_at = now
+            self.job['progress_at'] = time.time()
+        self.job.update(paused=paused, paused_seconds=self.paused_seconds,
+                        phase='Paused for recording' if paused else 'Finalizing / validating' if self.values.get('progress')=='end' else 'Processing')
+        if self.telemetry:
+            self.telemetry.set_job(self.job)
 
     def sample(self):
         pass  # A dedicated reader drains the pipe continuously using bounded memory.
@@ -362,13 +417,16 @@ class ProgressCapture:
             if self.thread:
                 self.thread.join(timeout=2)
             kind = 'processing-yielded' if interrupted else 'ffmpeg-finished' if returncode==0 else 'processing-failed'
-            self.telemetry.event(kind,'%s: FFmpeg exit %s%s' % (self.kind,returncode,'; yielded to recording/shutdown' if interrupted else ''),
-                                 self.inputs[0] if self.inputs else None)
+            if self.telemetry:
+                self.telemetry.event(kind,'%s: FFmpeg exit %s%s' % (self.kind,returncode,'; yielded to recording/shutdown' if interrupted else ''),
+                                     self.inputs[0] if self.inputs else None)
         finally:
-            self.telemetry.set_job(None)
+            if self.telemetry:
+                self.telemetry.set_job(None)
             if self.reader:
                 self.reader.close()
-            self.telemetry.invalidate()
+            if self.telemetry:
+                self.telemetry.invalidate()
 
 
 class HistoryHandler(logging.Handler):

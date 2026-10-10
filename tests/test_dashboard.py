@@ -77,6 +77,7 @@ def test_job_arguments_keep_paths_with_spaces_and_classify_stitching(tmp_path,mo
             self.info=dict(pid=pid,ppid=ppid,name='python',cmdline=args,create_time=10)
         def cwd(self):return str(tmp_path)
         def cpu_percent(self):return 1
+        def status(self):return dash.psutil.STATUS_RUNNING
         def memory_info(self):return SimpleNamespace(rss=100)
     processes=[Process(1,['python3',str(tmp_path/'twitch-recorder.py')],0),
                Process(2,['ffmpeg','-f','concat','-i',str(concat),'-c','copy','-y',str(output)],1),

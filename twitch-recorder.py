@@ -59,6 +59,7 @@ class TwitchRecorder:
         self.idle_compress_crf = config_data.get("idle_compress_crf", 28)
         self.idle_compress_preset = config_data.get("idle_compress_preset", "medium")
         self.idle_compress_audio_bitrate = config_data.get("idle_compress_audio_bitrate", "128k")
+        self.idle_compress_stall_timeout = max(60, config_data.get("idle_compress_stall_timeout_seconds", 1800))
         self.processing_threads = max(1, config_data.get("processing_threads", 1))
         self.stitch_recordings_enabled = config_data.get("stitch_recordings_enabled", True)
         self.stitch_max_gap_seconds = max(0, config_data.get("stitch_max_gap_seconds", 900))
@@ -348,6 +349,7 @@ class TwitchRecorder:
             self._idle_processing_thread.start()
 
     def _run_idle_processing(self, paths):
+        self._idle_processing_paths = paths
         try:
             for username in self.usernames:
                 if self._shutdown_event.is_set() or self.active_recordings > 0:
@@ -986,14 +988,40 @@ class TwitchRecorder:
         os.close(fd)
         return path
 
-    def _run_background_ffmpeg(self, command, timeout):
-        """Run bounded background work, reaping the child on cancellation or timeout."""
+    def _wait_for_compression_idle(self):
+        while self.active_recordings and not self._shutdown_event.is_set():
+            self._shutdown_event.wait(0.5)
+        if self._shutdown_event.is_set():
+            raise ProcessingInterrupted()
+
+    def _process_before_compression_resume(self):
+        """Finish newly recorded footage while the encoder remains suspended."""
+        for username, (recorded_path, processed_path) in getattr(self, '_idle_processing_paths', {}).items():
+            processed_any = False
+            while True:
+                self._check_processing_idle()
+                before = {str(path) for path in Path(recorded_path).glob('*.mp4')}
+                if not before:
+                    break
+                self.process_previous_recordings(recorded_path, processed_path)
+                self._check_processing_idle()
+                after = {str(path) for path in Path(recorded_path).glob('*.mp4')}
+                if after == before:
+                    break  # A failed/busy source must not cause an endless retry loop.
+                processed_any = True
+            if processed_any and not list(Path(recorded_path).glob('*.mp4')) and getattr(self, 'stitch_recordings_enabled', True):
+                self.stitch_processed_recordings(processed_path)
+
+    def _run_background_ffmpeg(self, command, timeout, pause_for_recordings=False):
+        """Pause compression for recordings; cancel other work; always reap children."""
         self._check_processing_idle()
         process = None
         self._processing_active.set()
         telemetry = getattr(self, '_telemetry', None)
         capture = None
         interrupted = False
+        suspended = False
+        control = None
         try:
             # Keep verbose FFmpeg output off the heap for multi-hour recordings.
             with tempfile.TemporaryFile(mode='w+b') as stderr:
@@ -1002,6 +1030,9 @@ class TwitchRecorder:
                         capture = telemetry.progress(command)
                     except Exception:
                         capture = None
+                if pause_for_recordings and capture is None:
+                    from recorder_state import ProgressCapture
+                    capture = ProgressCapture(None, command)
                 process = subprocess.Popen(capture.command if capture else command,
                     stdout=capture.output if capture else subprocess.DEVNULL, stderr=stderr)
                 if capture:
@@ -1011,22 +1042,69 @@ class TwitchRecorder:
                         psutil.Process(process.pid).nice(10)
                 except (psutil.Error, OSError):
                     pass
-                deadline = time.monotonic() + timeout
+                deadline = time.monotonic() + timeout if timeout is not None else None
                 try:
                     while process.poll() is None:
                         if capture:
                             capture.sample()
-                        self._check_processing_idle()
-                        if time.monotonic() >= deadline:
+                        if self._shutdown_event.is_set():
+                            raise ProcessingInterrupted()
+                        if pause_for_recordings:
+                            if self.active_recordings:
+                                if not suspended:
+                                    try:
+                                        control = psutil.Process(process.pid)
+                                        control.suspend()
+                                    except psutil.NoSuchProcess:
+                                        if process.poll() is not None:
+                                            break
+                                        raise
+                                    suspended = True
+                                    capture.set_paused(True)
+                                    logging.info('Idle compression paused for recording (PID %s); progress retained', process.pid)
+                                    self._dashboard_event('compression-paused', 'Compression paused for recording; progress retained', command[-1])
+                                self._shutdown_event.wait(0.5)
+                                continue
+                            if suspended:
+                                try:
+                                    self._process_before_compression_resume()
+                                except ProcessingInterrupted:
+                                    if self._shutdown_event.is_set():
+                                        raise
+                                    continue  # Another recording started; retain this encoder.
+                                finally:
+                                    self._processing_active.set()
+                                control.resume()
+                                suspended = False
+                                capture.set_paused(False)
+                                logging.info('Idle compression resumed (PID %s)', process.pid)
+                                self._dashboard_event('compression-resumed', 'Compression resumed from saved in-memory progress', command[-1])
+                            stall = getattr(self, 'idle_compress_stall_timeout', 1800)
+                            if time.monotonic() - capture.last_advance_at >= stall:
+                                raise subprocess.TimeoutExpired(command, stall)
+                        else:
+                            self._check_processing_idle()
+                        if deadline is not None and time.monotonic() >= deadline:
                             raise subprocess.TimeoutExpired(command, timeout)
                         self._shutdown_event.wait(0.5)
-                    self._check_processing_idle()
+                    if pause_for_recordings:
+                        if self.active_recordings:
+                            capture.set_paused(True)
+                        self._wait_for_compression_idle()
+                        capture.set_paused(False)
+                    else:
+                        self._check_processing_idle()
                     stderr.seek(0, os.SEEK_END)
                     stderr.seek(max(0, stderr.tell() - 16384))
                     return subprocess.CompletedProcess(command, process.returncode, '',
                                                        stderr.read().decode(errors='replace'))
                 finally:
                     if process.poll() is None:
+                        if suspended:
+                            try:
+                                control.resume()
+                            except psutil.NoSuchProcess:
+                                pass
                         process.terminate()
                         try:
                             process.wait(timeout=5)
@@ -1139,7 +1217,7 @@ class TwitchRecorder:
             marker = source + '.compressed'
             
             file_size_gb = os.path.getsize(source) / (1024**3)
-            timeout_seconds = self._calculate_ffmpeg_timeout(source, file_size_gb)
+            self._probe_media_duration_seconds(source)  # Cache duration for long-running progress/ETA.
             
             logging.info(f"Idle compress: {filename} ({file_size_gb:.2f}GB)")
             
@@ -1164,7 +1242,7 @@ class TwitchRecorder:
                 "-movflags", "+faststart",
                 "-y",
                 temp_output
-            ], timeout_seconds)
+            ], None, pause_for_recordings=True)
             
             if result.returncode != 0:
                 logging.error(f"Idle compress failed for {filename}: {result.stderr}")
@@ -1174,7 +1252,7 @@ class TwitchRecorder:
             
             # Verify compressed file is valid and smaller
             if self._valid_media_output(temp_output, source):
-                self._check_processing_idle()
+                self._wait_for_compression_idle()
                 original_size = os.path.getsize(source)
                 compressed_size = os.path.getsize(temp_output)
                 savings = (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
@@ -1199,7 +1277,8 @@ class TwitchRecorder:
         except ProcessingInterrupted:
             logging.info(f"Idle compression postponed for {processed_path}")
         except subprocess.TimeoutExpired:
-            logging.error(f"Idle compress timeout for {processed_path}")
+            logging.error(f"Idle compression stalled for {processed_path}; no encoding progress for "
+                          f"{getattr(self, 'idle_compress_stall_timeout', 1800)}s")
         except Exception as e:
             logging.error(f"Idle compress error: {e}")
         finally:
