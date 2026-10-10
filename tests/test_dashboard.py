@@ -124,7 +124,7 @@ def test_long_file_paths_wrap_instead_of_hiding_the_filename(tmp_path,monkeypatc
     assert len(screen.addnstr.call_args_list)>1
 
 
-@pytest.mark.parametrize('tab',range(4))
+@pytest.mark.parametrize('tab',range(6))
 def test_all_views_render_at_standard_and_small_sizes(tmp_path,monkeypatch,tab):
     monkeypatch.setattr(dash.curses,'color_pair',lambda number: 0)
     c=collector(tmp_path,monkeypatch)

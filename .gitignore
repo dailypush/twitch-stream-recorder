@@ -80,6 +80,7 @@ config/config.json
 config/eventsub-token.json
 config/eventsub-device.json
 .eventsub/
+.dashboard/
 
 # Recordings
 Recorded/

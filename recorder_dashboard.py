@@ -1,5 +1,7 @@
 """A read-only, low-overhead curses dashboard for the Twitch recorder (Python 3.7+)."""
 import argparse
+import base64
+import sqlite3
 import collections
 import curses
 import datetime
@@ -15,10 +17,13 @@ from pathlib import Path
 
 import psutil
 
+from recorder_state import (broadcast_groups, processing_queue, read_json, scan_catalog,
+                            status_directory, request_retry, atomic_json, redact)
+
 ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 NAME = re.compile(r'^(.+?) - (\d{4}-\d{2}-\d{2} \d{2}h\d{2}m\d{2}s) - (.+)\.mp4$')
 STAGES = ('All', 'Raw', 'Processed', 'Stitched', 'Failed')
-TABS = ('Overview', 'Recordings', 'Activity', 'Health')
+TABS = ('Overview', 'Recordings', 'Activity', 'Health', 'Queue', 'History')
 
 
 def clean(text):
@@ -149,42 +154,38 @@ class Collector:
         self.service = {}
         self.previous_sizes = {}
         self.snapshot_data = {}
+        self.status = {}
+        self.status_live = False
+        self.history_at = 0
+        self.history = []
         psutil.cpu_percent(interval=None)
 
+    def read_journal(self, table):
+        path = self.base / '.dashboard' / 'history.sqlite'
+        if not path.exists():
+            return [] if table == 'events' else {}
+        try:
+            db = sqlite3.connect(path.as_uri()+'?mode=ro', uri=True, timeout=.5)
+            try:
+                if table == 'events':
+                    return [dict(at=row[0],kind=row[1],message=row[2],path=row[3]) for row in
+                        db.execute('SELECT at,kind,message,path FROM events ORDER BY id DESC LIMIT 100')]
+                return {row[0]:(row[1],json.loads(row[2])) for row in db.execute('SELECT path,fingerprint,data FROM media')}
+            finally:
+                db.close()
+        except (OSError,sqlite3.Error,ValueError):
+            return [] if table == 'events' else {}
+
     def inventory(self, now, force=False):
-        if not force and now - self.catalog_at < self.inventory_interval:
+        if self.status_live and not force:
+            self.catalog = self.status.get('catalog', [])
+            self.catalog_at = self.status.get('catalog_at', now)
+            self.catalog_errors = self.status.get('catalog_errors', [])
             return
-        entries, errors = [], []
-        for folder, stage in (('recorded', 'Raw'), ('processed', 'Processed'), ('failed', 'Failed')):
-            directory = self.root / folder
-            if not directory.exists():
-                continue
-            def scan_error(exc):
-                errors.append('Cannot scan %s' % exc.filename)
-            for parent, dirs, files in os.walk(str(directory), onerror=scan_error):
-                dirs[:] = [name for name in dirs if not name.startswith('.')]
-                for name in files:
-                    if name.startswith('.') or not name.endswith('.mp4'):
-                        continue
-                    path = Path(parent) / name
-                    try:
-                        stat = path.stat()
-                        relative = path.relative_to(directory)
-                        channel = relative.parts[0] if len(relative.parts) > 1 else 'unknown'
-                        kind = 'Stitched' if 'stitched' in relative.parts[:-1] else stage
-                        match = NAME.match(name)
-                        title = match[3] if match else path.stem
-                        if title.endswith(' - stitched'):
-                            title = title[:-11]
-                        entries.append(dict(path=str(path), name=name, channel=channel,
-                            stage=kind, size=stat.st_size, modified=stat.st_mtime,
-                            title=title,
-                            compressed=Path(str(path)+'.compressed').exists(),
-                            upload_pending=Path(str(path)+'.upload-pending').exists()))
-                    except OSError:
-                        continue  # File may be moving between processing stages.
-        self.catalog = sorted(entries, key=lambda row: row['modified'], reverse=True)
-        self.catalog_errors, self.catalog_at = errors, now
+        if not force and now-self.catalog_at < self.inventory_interval:
+            return
+        self.catalog, self.catalog_errors = scan_catalog(self.root,self.read_journal('media'))
+        self.catalog_at = now
 
     def logs(self, now):
         if now - self.log_at >= 15 or self.log_path is None:
@@ -290,10 +291,24 @@ class Collector:
 
     def snapshot(self, force=False):
         now = time.time()
-        self.inventory(now, force)
-        self.logs(now)
         self.service_status(now)
         records, jobs = self.processes(now)
+        self.status = read_json(status_directory(self.base)/'status.json', {})
+        if not isinstance(self.status,dict):
+            self.status = {}
+        age = max(0,now-self.status.get('heartbeat_at',0))
+        self.status_live = (self.status.get('pid') in {r['pid'] for r in records} and
+                            age < 30 and not self.status.get('stopping'))
+        self.inventory(now, force)
+        self.logs(now)
+        if self.status_live:
+            self.history = self.status.get('history', [])
+            for job in jobs:
+                detail = next((row for row in self.status.get('jobs',[]) if row.get('pid')==job['pid']),None)
+                if detail:
+                    job.update({key:value for key,value in detail.items() if key not in ('inputs','output','source','kind')})
+        elif now-self.history_at >= 15:
+            self.history = self.read_journal('events');self.history_at = now
         memory = psutil.virtual_memory()
         storage = self.root if self.root.exists() else self.base
         disk = psutil.disk_usage(str(storage))
@@ -316,12 +331,30 @@ class Collector:
                         state = 'Unknown (previous recorder session)'
                 except ValueError:
                     state = 'Unknown'
+        notifications = self.status.get('notifications', {}) if self.status_live else {}
+        if self.config.get('eventsub_enabled') and self.status_live:
+            state = 'Connected' if notifications.get('connected') else 'Unavailable'
+            if notifications.get('connected') and notifications.get('last_message_at') and now-notifications['last_message_at'] > notifications.get('keepalive_seconds',30)+5:
+                state = 'Stale connection'
+        groups = broadcast_groups(self.catalog,self.config.get('stitch_max_gap_seconds',900))
+        queue = self.status.get('queue',[]) if self.status_live else processing_queue(self.catalog,groups,self.config,bool([job for job in jobs if job['kind']=='Recording']),jobs,now)
         counts = collections.Counter(row['stage'] for row in self.catalog)
         alerts = list(self.catalog_errors)
         if not records:
             alerts.append('Recorder is not running')
         if self.config.get('eventsub_enabled') and state != 'Connected':
             alerts.append('EventSub %s; status polling is the fallback' % state.lower())
+        if records and self.status and not self.status_live:
+            alerts.append('Recorder heartbeat is stale (%s); showing process/log fallback' % elapsed(age))
+        if notifications.get('failure_count',0):
+            alerts.append('EventSub reconnect failures this recorder session: %s' % notifications['failure_count'])
+        for job in jobs:
+            if job.get('no_growth',0)>=self.config.get('recording_stall_timeout_seconds',300) and (
+                    job.get('phase')!='Finalizing / validating' and now-job.get('progress_at',now-job.get('no_growth',0))>=300):
+                alerts.append('%s %s has no output/media progress for %s' % (job['kind'],job['channel'],elapsed(job['no_growth'])))
+        next_work = next((row for row in queue if row.get('required_bytes')),None)
+        if next_work and disk.free < next_work['required_bytes']+128*1024*1024:
+            alerts.append('Insufficient working space for %s %s (needs about %s)' % (next_work['kind'],next_work['title'],human_bytes(next_work['required_bytes'])))
         if disk.percent >= 85:
             alerts.append('Disk space is low: %.1f%% used' % disk.percent)
         if memory.percent >= 85:
@@ -339,7 +372,13 @@ class Collector:
             disk_free=disk.free, disk_total=disk.total, uptime=now-psutil.boot_time(),
             temperature=temperature, load=list(os.getloadavg()) if hasattr(os, 'getloadavg') else [],
             catalog=self.catalog, catalog_at=self.catalog_at, counts=dict(counts),
-            logs=list(self.tail.lines), log_path=self.tail.path, alerts=alerts)
+            logs=list(self.tail.lines), log_path=self.tail.path, alerts=alerts,
+            status_live=self.status_live, heartbeat_age=age if self.status else None,
+            notifications=notifications, channels=self.status.get('channels',{}) if self.status_live else {},
+            fallback_active=self.status.get('fallback_active') if self.status_live else None,
+            recovery_users=self.status.get('recovery_users',[]) if self.status_live else [],
+            queue=queue, broadcasts=groups, history=self.history,
+            commands=self.status.get('commands',[]) if self.status_live else [])
         return self.snapshot_data
 
 
@@ -352,6 +391,7 @@ def summary_lines(data):
         'Files: ' + ' | '.join('%s %d' % (stage, data['counts'].get(stage, 0)) for stage in STAGES[1:])]
     for job in data['jobs']:
         lines.append('%s %s | PID %s | %s | %s written | %s' % (job['kind'],job['channel'],job['pid'],elapsed(job['elapsed']),human_bytes(job['size']),job['output']))
+    lines.append('Broadcasts: %s | Queued tasks: %s | Status: %s' % (len(data.get('broadcasts',[])),len(data.get('queue',[])),'Live heartbeat' if data.get('status_live') else 'Process/log fallback'))
     lines += ['ATTENTION: '+alert for alert in data['alerts']]
     return lines
 
@@ -367,12 +407,17 @@ class Dashboard:
         self.searching = False
         self.selected_path = None
         self.problem = None
+        self.broadcasts = False
 
     def rows(self):
         result = [row for row in self.data.get('catalog', []) if
                   (self.channel == 'All' or row['channel'] == self.channel) and
                   (self.stage == 'All' or row['stage'] == self.stage) and
                   self.query.lower() in (row['name']+' '+row['channel']).lower()]
+        if self.broadcasts:
+            groups=broadcast_groups(result,self.collector.config.get('stitch_max_gap_seconds',900))
+            result=[dict(path=group['id'],name=group['title'],title=group['title'],channel=group['channel'],
+                stage=group['state'],size=group['size'],modified=group['modified'],group=group) for group in groups]
         return sorted(result, key=lambda row: row['size'] if self.sort == 'largest' else row['modified'], reverse=True)
 
     def text(self, screen, y, x, value, attr=0):
@@ -395,21 +440,35 @@ class Dashboard:
         d = self.data
         self.text(screen,0,1,'TWITCH RECORDER  |  '+d['hostname'],curses.A_BOLD | curses.color_pair(1))
         self.text(screen,0,max(30,w-34),display_time(d['now'],d['timezone']) + ('  PAUSED' if self.paused else '  LIVE'))
-        self.text(screen,1,1,'  '.join(('[%d %s]' if index == self.tab else ' %d %s ') % (index+1,name) for index,name in enumerate(TABS)),curses.A_BOLD)
+        labels=TABS if w>=100 else ('Overview','Rec','Log','Health','Queue','Hist')
+        self.text(screen,1,1,' '.join(('[%d %s]' if index == self.tab else ' %d %s ') % (index+1,name) for index,name in enumerate(labels)),curses.A_BOLD)
         self.text(screen,2,1,'Recorder %s  |  EventSub %s  |  %d job(s)  |  %s free' % (
             'RUNNING' if d['recorder'] else 'STOPPED',d['eventsub'],len(d['jobs']),human_bytes(d['disk_free'])))
         screen.hline(3,1,'-',w-2)
         if self.tab == 0:
             lines = summary_lines(d)[2:4] + ['ATTENTION: '+alert for alert in d['alerts']]
+            lines += ['Status: '+('Live heartbeat (%s old)'%elapsed(d['heartbeat_age']) if d.get('status_live') else 'Process/log fallback')]
+            for name,channel in d.get('channels',{}).items():
+                lines.append('Channel %s: %s%s' % (name,channel['state'],' (recording)' if any(job['kind']=='Recording' and job['channel']==name for job in d['jobs']) else ''))
             lines += ['', 'CURRENT WORK']
             if not d['jobs']:
                 lines.append('Idle: waiting for a stream or the next processing cycle')
             for job in d['jobs']:
                 lines += [job['kind'].upper()+'  '+job['channel']+'  |  elapsed '+elapsed(job['elapsed']),
                           'Written '+human_bytes(job['size'])+'  |  growth '+human_bytes(job['rate'])+'/s  |  CPU %.1f%%' % job['cpu']]
+                if job.get('percent') is not None:
+                    progress='Media progress %.1f%% (%s / %s)' % (job['percent'],elapsed(job['media_seconds']),elapsed(job['expected_seconds']))
+                    if job.get('speed') and job['speed']>0 and job['percent']<100:
+                        progress+='  |  approx ETA '+elapsed((job['expected_seconds']-job['media_seconds'])/job['speed'])
+                    lines.append(progress)
+                if job.get('phase'):
+                    lines.append('Phase: '+job['phase'])
                 for path in job['inputs'] or [job['source'] or '--']:
                     lines += textwrap.wrap('Input: '+str(path),width=w-3)
                 lines += textwrap.wrap('Output: '+str(job['output']),width=w-3)
+            lines += ['', 'PROCESSING QUEUE: %s task(s), %s retry request(s)' % (len(d.get('queue',[])),len(d.get('commands',[])))]
+            for row in d.get('queue',[])[:3]:
+                lines.append('%s %s: %s | %s' % (row['kind'],row['channel'],row['title'],row['reason']))
             lines += ['', 'RECENT FILES']
             for row in d['catalog'][:5]:
                 lines.append('%-9s %-14s %-10s %s' % (row['stage'],row['channel'],human_bytes(row['size']),row['title']))
@@ -423,19 +482,32 @@ class Dashboard:
                     self.selection = match
             self.selection = max(0,min(self.selection,len(rows)-1))
             self.selected_path = rows[self.selection]['path'] if rows else None
-            self.text(screen,4,1,'Channel: %s  |  Stage: %s  |  Sort: %s  |  %d files' % (self.channel,self.stage,self.sort,len(rows)))
+            self.text(screen,4,1,'%s | Channel: %s | Stage: %s | %s | %d rows' % ('Broadcasts' if self.broadcasts else 'Files',self.channel,self.stage,self.sort,len(rows)))
             self.text(screen,5,1,('Search: '+self.query+'_' if self.searching else 'Filter: '+(self.query or '(none)')))
             if self.detail and rows:
                 row = rows[self.selection]
-                details = ['FILE DETAILS', '',row['name'],'', 'Channel: '+row['channel'],'Stage: '+row['stage'],
-                    'Size: '+human_bytes(row['size']),'Updated: '+display_time(row['modified'],d['timezone'])+' '+d['timezone'],
-                    'Compressed: '+str(row['compressed']),'Upload pending: '+str(row['upload_pending']), '', 'Full path:',row['path']]
-                try:
-                    manifest = Path(row['path']+'.parts.json')
-                    if manifest.exists():
-                        details += ['', 'JOINED PARTS']+json.loads(manifest.read_text())
-                except (OSError,ValueError):
-                    details.append('Parts manifest unavailable')
+                if row.get('group'):
+                    group=row['group']
+                    details=['BROADCAST DETAILS','',group['title'],'Channel: '+group['channel'],
+                        'State: '+group['state'],'Original parts: '+str(group['part_count']),
+                        'Started: '+display_time(group['started_at'],d['timezone']),
+                        'Storage including retained parts: '+human_bytes(group['size']),'','FILES']
+                    for part in group['files']:
+                        details += [part['stage']+'  '+human_bytes(part['size']),part['path']]
+                    details += ['', 'b: switch to individual files for copy/retry actions']
+                else:
+                    media=row.get('media',{})
+                    details=['FILE DETAILS','',row['name'],'','Channel: '+row['channel'],'Stage: '+row['stage'],
+                        'Size: '+human_bytes(row['size']),'Updated: '+display_time(row['modified'],d['timezone'])+' '+d['timezone'],
+                        'Duration: '+(elapsed(media['duration']) if media.get('duration') else 'not yet cached'),
+                        'Video: %s x %s %s' % (media.get('width','--'),media.get('height','--'),media.get('codec','--')),
+                        'Processing attempts: '+str(row.get('attempts',0)),
+                        'Compressed: '+str(row['compressed']),'Upload pending: '+str(row['upload_pending']), '', 'Full path:',row['path']]
+                    if row.get('parts'):
+                        details += ['', 'JOINED PARTS']+row['parts']
+                    events=[event for event in d.get('history',[]) if event.get('path')==row['path']]
+                    if events:
+                        details += ['', 'FILE HISTORY']+[display_time(e['at'],d['timezone'])+' '+e['kind']+': '+e['message'] for e in events]
                 self.draw_lines(screen,details,7,h-3)
             else:
                 self.text(screen,7,1,'STAGE      CHANNEL         SIZE        UPDATED           TITLE' if w >= 100 else
@@ -445,16 +517,16 @@ class Dashboard:
                 for offset,row in enumerate(rows[start:start+visible]):
                     selected = start+offset == self.selection
                     if w >= 100:
-                        line = '%-10s %-15s %-11s %-17s %s' % (row['stage'],row['channel'][:14],human_bytes(row['size']),
+                        line = '%-10s %-15s %-11s %-17s %s' % (row['stage'][:10],row['channel'][:14],human_bytes(row['size']),
                             display_time(row['modified'],d['timezone'])[:16],row['title'])
                     else:
-                        line = '%-10s %-12s %-10s %s' % (row['stage'],row['channel'][:12],human_bytes(row['size']),row['title'])
+                        line = '%-10s %-12s %-10s %s' % (row['stage'][:10],row['channel'][:12],human_bytes(row['size']),row['title'])
                     self.text(screen,8+offset,1,line,curses.A_REVERSE if selected else 0)
                 if not rows:
                     self.text(screen,9,1,'No files match these filters.')
         elif self.tab == 2:
             self.draw_lines(screen,list(reversed(d['logs'])),4,h-3)
-        else:
+        elif self.tab == 3:
             service = d['service']
             lines = ['SYSTEM HEALTH', '', 'CPU usage: %.1f%%  |  load %s' % (d['cpu'],', '.join('%.2f'%v for v in d['load'])),
                 'Memory: %.1f%% used  |  %s available / %s total' % (d['memory_percent'],human_bytes(d['memory_available']),human_bytes(d['memory_total'])),
@@ -463,7 +535,14 @@ class Dashboard:
                 'System uptime: '+elapsed(d['uptime']), '', 'RECORDER AND NOTIFICATIONS',
                 'Service: '+service.get('unit','process detection')+'  '+service.get('ActiveState',''),
                 'Service restarts: '+service.get('NRestarts','--'),
-                'EventSub last reported state: '+d['eventsub'],
+                'Status source: '+('Recorder heartbeat' if d.get('status_live') else 'Process/log fallback'),
+                'Heartbeat age: '+(elapsed(d['heartbeat_age']) if d.get('heartbeat_age') is not None else '--'),
+                'EventSub state: '+d['eventsub'],
+                'EventSub last received message: '+display_time(d.get('notifications',{}).get('last_message_at'),d['timezone']),
+                'EventSub last stream event: '+display_time(d.get('notifications',{}).get('last_event_at'),d['timezone']),
+                'EventSub reconnect failures: '+str(d.get('notifications',{}).get('failure_count','--')),
+                'Fallback polling active: '+('Yes' if d.get('fallback_active') else 'No' if d.get('fallback_active') is False else 'Unknown'),
+                'Targeted recovery checks: '+(', '.join(d.get('recovery_users',[])) or 'none'),
                 'EventSub report timestamp (source log zone): '+str(d['eventsub_reported'] or '--'),
                 'Fallback polling setting: %ss'%d['poll_interval'],
                 'Recorder PID(s): '+', '.join(str(r['pid']) for r in d['recorder']),
@@ -472,18 +551,38 @@ class Dashboard:
                 'Catalog scanned: '+display_time(d['catalog_at'],d['timezone']),
                 'Displayed file timestamps: '+d['timezone'], '', 'ATTENTION']+(d['alerts'] or ['No current health warnings'])
             self.draw_lines(screen,lines,4,h-3)
+        elif self.tab == 4:
+            lines=['PROCESSING QUEUE  (%d tasks)'%len(d.get('queue',[])),
+                   'Queue is a work plan, not a guaranteed execution order. Active recordings have priority.','']
+            for row in d.get('queue',[]):
+                lines += ['%s  %s  %s  |  %s' % (row['state'],row['kind'],row['channel'],row['title']),
+                    'Reason: '+row['reason'],'Attempts: %s | Working space: %s' % (row['attempts'],human_bytes(row['required_bytes'])),
+                    str(row['path']),'']
+            if d.get('commands'):
+                lines += ['RETRY REQUESTS WAITING FOR IDLE']+[str(row.get('path')) for row in d['commands']]
+            self.draw_lines(screen,lines if d.get('queue') or d.get('commands') else lines+['Queue empty'],4,h-3)
+        elif self.tab == 5:
+            lines=['PERSISTENT HISTORY (newest first)','','D: export a diagnostic report','']
+            for event in d.get('history',[]):
+                lines += [display_time(event['at'],d['timezone'])+'  '+event['kind'].upper(),event['message'],'']
+            if not d.get('history'):
+                lines += ['History starts when the recorder status publisher is installed.']
+            self.draw_lines(screen,lines,4,h-3)
         if self.help:
             screen.erase()
-            self.draw_lines(screen,['KEYBOARD SHORTCUTS','', '1-4 / Tab      Switch view',
+            self.draw_lines(screen,['KEYBOARD SHORTCUTS','', '1-6 / Tab      Switch view',
                 'Up/Down j/k    Select file or scroll', 'PgUp/PgDn      Scroll a page',
                 'Enter          Open/close file details', '/              Search filenames and channels',
                 'c              Cycle channel filter', 'g              Cycle Raw/Processed/Stitched/Failed',
-                's              Sort newest / largest', 'r              Refresh all data now',
+                's              Sort newest / largest', 'b              Toggle broadcasts / individual files',
+                'p              Copy selected file path (supported terminals)',
+                'R              Request retry of selected quarantined file',
+                'D              Export diagnostic report', 'r              Refresh all data now',
                 'Space          Pause/resume display', 'Esc            Close details / clear search',
                 '?              Toggle help', 'q              Quit', '',
-                'Dashboard is read-only. File inventory refreshes every 30 seconds.',
-                'Output growth shows bytes written, not an estimated completion percentage.'],1,h-2)
-        self.text(screen,h-2,1,self.problem or ('/: search  c: channel  g: stage  s: sort  Enter: details  r: refresh  Space: pause  ?: help  q: quit'))
+                'Retries are queued and handled by the recorder when idle.',
+                'Media progress may reach 100% before finalizing and validation finish.'],1,h-2)
+        self.text(screen,h-2,1,self.problem or ('/: search  b: broadcasts/files  c/g: filter  Enter: details  R: retry  D: report  ?: help  q: quit'))
         screen.refresh()
 
     def draw_lines(self,screen,lines,start,end):
@@ -509,8 +608,8 @@ class Dashboard:
         if key == ord('?'):
             self.help=not self.help
         elif key == 9:
-            self.tab=(self.tab+1)%4;self.scroll=0;self.detail=False
-        elif ord('1') <= key <= ord('4'):
+            self.tab=(self.tab+1)%len(TABS);self.scroll=0;self.detail=False
+        elif ord('1') <= key <= ord('6'):
             self.tab=key-ord('1');self.scroll=0;self.detail=False
         elif key in (curses.KEY_DOWN,ord('j'),curses.KEY_NPAGE,curses.KEY_UP,ord('k'),curses.KEY_PPAGE):
             amount=10 if key in (curses.KEY_NPAGE,curses.KEY_PPAGE) else 1
@@ -524,12 +623,40 @@ class Dashboard:
         elif key==ord('/'):
             self.tab=1;self.searching=True;self.detail=False
         elif key==27:
-            self.detail=False;self.query='';self.scroll=0
+            self.detail=False;self.query='';self.scroll=0;self.problem=None
         elif key==ord('c'):
             channels=['All']+list(self.collector.channels)
             self.channel=channels[(channels.index(self.channel)+1)%len(channels)];self.selection=0;self.selected_path=None
         elif key==ord('g'):
             self.stage=STAGES[(STAGES.index(self.stage)+1)%len(STAGES)];self.selection=0;self.selected_path=None
+        elif key==ord('b'):
+            self.broadcasts=not self.broadcasts;self.detail=False;self.selection=0;self.selected_path=None
+        elif key in (ord('p'),ord('R')) and self.tab==1:
+            rows=self.rows()
+            if rows:
+                row=rows[max(0,min(self.selection,len(rows)-1))]
+                if row.get('group'):
+                    self.problem='Press b to select an individual file first'
+                elif key==ord('p'):
+                    encoded=base64.b64encode(row['path'].encode()).decode()
+                    sys.stdout.write('\x1b]52;c;'+encoded+'\x07');sys.stdout.flush()
+                    self.problem='Path copy requested; full path is also available in Details'
+                elif row['stage']!='Failed':
+                    self.problem='Retry is available for quarantined (Failed) files'
+                elif not self.data.get('status_live'):
+                    self.problem='Retry requires a healthy recorder heartbeat'
+                else:
+                    try:
+                        request_retry(self.collector.base,row['path'])
+                        self.problem='Retry requested; recorder will handle it when idle'
+                    except OSError as exc:
+                        self.problem='Retry request failed: '+str(exc)
+        elif key==ord('D'):
+            try:
+                path=export_report(self.collector.base,self.data)
+                self.problem='Report saved: '+str(path)
+            except OSError as exc:
+                self.problem='Report export failed: '+str(exc)
         elif key==ord('s'):
             self.sort='largest' if self.sort=='newest' else 'newest';self.selection=0;self.selected_path=None
         elif key==ord(' '):
@@ -551,19 +678,38 @@ class Dashboard:
             except curses.error:
                 curses.init_pair(1,curses.COLOR_CYAN,curses.COLOR_BLACK)
         screen.timeout(200)
+        self.broadcasts=True
         self.data=self.collector.snapshot(force=True)
+        dirty=True
+        size=screen.getmaxyx()
         next_update=time.monotonic()+self.refresh
         while True:
             if not self.paused and time.monotonic() >= next_update:
                 try:
-                    self.data=self.collector.snapshot();self.problem=None
+                    self.data=self.collector.snapshot()
+                    if self.problem and self.problem.startswith('Refresh unavailable:'):
+                        self.problem=None
                 except (OSError,psutil.Error) as exc:
                     self.problem='Refresh unavailable: '+str(exc)
                 next_update=time.monotonic()+self.refresh
-            self.render(screen)
+                dirty=True
+            if dirty or screen.getmaxyx()!=size:
+                self.render(screen);dirty=False;size=screen.getmaxyx()
             key=screen.getch()
-            if key != -1 and not self.key(key):
-                break
+            if key != -1:
+                if not self.key(key):
+                    break
+                dirty=True
+
+
+def export_report(base,data):
+    directory=Path(base)/'.dashboard'/'reports'
+    report=dict(data)
+    report['logs']=[redact(line) for line in data.get('logs',[])]
+    report['history']=[dict(event,message=redact(event['message'])) for event in data.get('history',[])]
+    path=directory/('diagnostics-'+time.strftime('%Y%m%d-%H%M%S')+'.json')
+    atomic_json(path,report)
+    return path
 
 
 def main(argv=None):
@@ -572,13 +718,14 @@ def main(argv=None):
     parser.add_argument('--config')
     parser.add_argument('--refresh',type=float,default=2)
     parser.add_argument('--once',action='store_true',help='Print a status snapshot without a terminal UI')
+    parser.add_argument('--export',action='store_true',help='Save a diagnostic report')
     parser.add_argument('--json',action='store_true',help='Print a machine-readable status snapshot')
     args=parser.parse_args(argv)
     try:
         collector=Collector(args.base,args.config)
-        if args.once or args.json or not sys.stdin.isatty() or not sys.stdout.isatty():
+        if args.once or args.json or args.export or not sys.stdin.isatty() or not sys.stdout.isatty():
             data=collector.snapshot(force=True)
-            print(json.dumps(data,indent=2) if args.json else '\n'.join(summary_lines(data)))
+            print(export_report(collector.base,data) if args.export else json.dumps(data,indent=2) if args.json else '\n'.join(summary_lines(data)))
         else:
             curses.wrapper(Dashboard(collector,max(1,args.refresh)).run)
         return 0

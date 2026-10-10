@@ -89,6 +89,18 @@ class EventSubListener(threading.Thread):
         self.seen = collections.OrderedDict()
         self.connected = threading.Event()
         self.broadcasters = None
+        self.last_message_at = None
+        self.last_event_at = None
+        self.connected_since = None
+        self.failure_count = 0
+        self.last_error = None
+        self.keepalive_seconds = 30
+
+    def health_snapshot(self):
+        return dict(connected=self.connected.is_set(), last_message_at=self.last_message_at,
+                    last_event_at=self.last_event_at, connected_since=self.connected_since,
+                    failure_count=self.failure_count, last_error=self.last_error,
+                    listener_alive=self.is_alive(), keepalive_seconds=self.keepalive_seconds)
 
     def api(self, method, path, **kwargs):
         response = requests.request(method, API + path, headers={
@@ -177,17 +189,22 @@ class EventSubListener(threading.Thread):
                         raise RuntimeError('EventSub connection closed')
                     message = json.loads(raw)
                     kind = message['metadata']['message_type']
+                    self.last_message_at = time.time()
                     if kind == 'session_welcome':
                         session = message['payload']['session']
                         keepalive = session.get('keepalive_timeout_seconds') or 30
+                        self.keepalive_seconds = keepalive
                         self.subscribe(session['id'])
                         # Recover broadcasts already live or missed while disconnected.
                         for username in sorted(self.usernames):
                             self.on_online(username)
                         self.connected.set()
+                        self.connected_since = time.time()
+                        self.last_error = None
                         retry_delay = 5
                         logging.info('EventSub connected; routine polling suspended; outage fallback enabled')
                     elif kind == 'notification':
+                        self.last_event_at = time.time()
                         self.notification(message)
                     elif kind == 'session_reconnect':
                         url = self.reconnect_url(message['payload']['session']['reconnect_url'])
@@ -204,6 +221,8 @@ class EventSubListener(threading.Thread):
                         socket = replacement
                         socket.settimeout(1)
                         keepalive = welcome['payload']['session'].get('keepalive_timeout_seconds') or 30
+                        self.keepalive_seconds = keepalive
+                        self.last_message_at = time.time()
                         logging.info('EventSub connection migrated')
                         for username in sorted(self.usernames):
                             self.on_online(username)
@@ -213,6 +232,8 @@ class EventSubListener(threading.Thread):
                     deadline = time.monotonic() + keepalive
             except Exception as exc:
                 self.connected.clear()
+                self.failure_count += 1
+                self.last_error = type(exc).__name__ + ': ' + str(exc)
                 # Never include OAuth responses or secrets in logs.
                 logging.warning('EventSub unavailable (%s); polling remains active; retry in %ss',
                                 type(exc).__name__ + ': ' + str(exc), retry_delay)

@@ -440,6 +440,7 @@ class TwitchRecorder:
     def run(self):
         """Main run loop with proper threading"""
         paths = self.create_directories()
+        self._start_dashboard_status(paths)
         
         # Use ThreadPoolExecutor for concurrent recording checks
         self._executor = ThreadPoolExecutor(max_workers=min(len(self.usernames), 5))
@@ -497,7 +498,12 @@ class TwitchRecorder:
                 # Python 3.7 compatible shutdown (cancel_futures added in 3.9)
                 self._executor.shutdown(wait=False)
             logging.info("Cleaning up processes...")
-            self._cleanup_processes()  # This already handles process termination properly
+            self._cleanup_processes()
+            telemetry = getattr(self, "_telemetry", None)
+            if telemetry:
+                telemetry.stop.set()
+                telemetry.wake.set()
+                telemetry.join(timeout=10)  # This already handles process termination properly
 
     def _start_eventsub(self, paths):
         if not getattr(self, 'eventsub_enabled', False):
@@ -580,6 +586,9 @@ class TwitchRecorder:
             self._next_user_check_at[username] = 0
 
     def _update_user_check_schedule(self, username, status):
+        telemetry = getattr(self, "_telemetry", None)
+        if telemetry:
+            telemetry.note_channel(username, status.name)
         if status in (TwitchResponseStatus.OFFLINE, TwitchResponseStatus.NOT_FOUND):
             if hasattr(self, '_eventsub_recovery_lock'):
                 with self._eventsub_recovery_lock:
@@ -756,14 +765,18 @@ class TwitchRecorder:
         match = re.fullmatch(r'(.+?) - (\d{4}-\d{2}-\d{2} \d{2}h\d{2}m\d{2}s) - (.+)\.mp4', path.name)
         if not match:
             return None
-        result = subprocess.run([
-            str(Path(self.ffmpeg_path).with_name('ffprobe')), '-v', 'error',
-            '-show_streams', '-show_format', '-show_data_hash', 'sha256',
-            '-of', 'json', str(path)
-        ], capture_output=True, text=True, timeout=30)
-        if result.returncode:
-            return None
-        probe = json.loads(result.stdout)
+        telemetry = getattr(self, '_telemetry', None)
+        cached = telemetry.journal.media(str(path)) if telemetry else None
+        probe = cached.get('stitch_probe') if cached else None
+        if not probe:
+            result = subprocess.run([
+                str(Path(self.ffmpeg_path).with_name('ffprobe')), '-v', 'error',
+                '-show_streams', '-show_format', '-show_data_hash', 'sha256',
+                '-of', 'json', str(path)
+            ], capture_output=True, text=True, timeout=30)
+            if result.returncode:
+                return None
+            probe = json.loads(result.stdout)
         duration = float(probe['format']['duration'])
         if not math.isfinite(duration) or duration <= 0:
             return None
@@ -783,6 +796,12 @@ class TwitchRecorder:
                 return None
             start, end = float(metadata['started_at']), float(metadata['ended_at'])
             stream_id = metadata.get('stream_id')
+        telemetry = getattr(self, '_telemetry', None)
+        if telemetry:
+            video = next((s for s in probe['streams'] if s.get('codec_type') == 'video'), {})
+            telemetry.cache_media(str(path), dict(duration=duration, width=video.get('width'),
+                height=video.get('height'), codec=video.get('codec_name'),
+                stitch_probe=dict(format=dict(duration=duration), streams=[{key:stream.get(key) for key in fields} for stream in probe['streams']])))
         return dict(path=path, start=start, end=end, duration=duration,
                     stream_id=stream_id, title=match[3], user=match[1], profile=profile)
 
@@ -859,6 +878,7 @@ class TwitchRecorder:
                         Path(str(destination) + '.upload-pending').touch()
                     os.replace(temp_output, destination)
                     manifest_path.write_text(json.dumps(names, indent=2))
+                    self._dashboard_event('broadcast-stitched', 'Published stitched broadcast with %s parts' % len(names), str(destination))
                     logging.info(f'Stitched {len(group)} recording parts into {destination}')
                     if self.upload_to_network_drive_enabled:
                         self.upload_to_network_drive(str(destination))
@@ -903,8 +923,12 @@ class TwitchRecorder:
             stem, ext = os.path.splitext(os.path.basename(recorded_filename))
             destination = os.path.join(failed_dir, f"{stem}.failed-{timestamp}{ext}")
 
+        attempts = self._read_processing_attempts(recorded_filename)
         shutil.move(recorded_filename, destination)
+        self._transfer_recording_metadata(recorded_filename, destination)
+        Path(str(destination)+'.failure.json').write_text(json.dumps(dict(attempts=attempts, failed_at=time.time(), reason='Processing retry limit reached')))
         self._clear_processing_attempts(recorded_filename)
+        self._dashboard_event('recording-quarantined', 'Processing retry limit reached', str(destination))
         logging.error(
             f"Quarantined recording after {self.max_processing_attempts} failed processing attempts: {destination}"
         )
@@ -966,10 +990,21 @@ class TwitchRecorder:
         self._check_processing_idle()
         process = None
         self._processing_active.set()
+        telemetry = getattr(self, '_telemetry', None)
+        capture = None
+        interrupted = False
         try:
             # Keep verbose FFmpeg output off the heap for multi-hour recordings.
             with tempfile.TemporaryFile(mode='w+b') as stderr:
-                process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=stderr)
+                if telemetry:
+                    try:
+                        capture = telemetry.progress(command)
+                    except Exception:
+                        capture = None
+                process = subprocess.Popen(capture.command if capture else command,
+                    stdout=capture.output if capture else subprocess.DEVNULL, stderr=stderr)
+                if capture:
+                    capture.attach(process)
                 try:
                     if os.name == 'posix':
                         psutil.Process(process.pid).nice(10)
@@ -978,6 +1013,8 @@ class TwitchRecorder:
                 deadline = time.monotonic() + timeout
                 try:
                     while process.poll() is None:
+                        if capture:
+                            capture.sample()
                         self._check_processing_idle()
                         if time.monotonic() >= deadline:
                             raise subprocess.TimeoutExpired(command, timeout)
@@ -995,7 +1032,12 @@ class TwitchRecorder:
                         except subprocess.TimeoutExpired:
                             process.kill()
                             process.wait()
+        except ProcessingInterrupted:
+            interrupted = True
+            raise
         finally:
+            if capture:
+                capture.finish(process.returncode if process else None, interrupted)
             self._processing_active.clear()
 
     def _valid_media_output(self, filename, source=None):
@@ -1043,6 +1085,7 @@ class TwitchRecorder:
             if self.upload_to_network_drive_enabled:
                 Path(processed_filename + '.upload-pending').touch()
             os.replace(temp_output, processed_filename)
+            self._dashboard_event('recording-processed', 'Verified remux published', processed_filename)
             logging.info(f"Successfully processed: {recorded_filename}")
             return True
         except subprocess.TimeoutExpired:
@@ -1137,6 +1180,7 @@ class TwitchRecorder:
                 
                 if compressed_size < original_size:
                     os.replace(temp_output, source)
+                    self._dashboard_event('recording-compressed', 'Verified smaller compressed output published', source)
                     # Mark as compressed so we don't re-process
                     with open(marker, 'w') as f:
                         f.write(f"compressed {datetime.datetime.now().isoformat()} savings={savings:.1f}%")
@@ -1163,6 +1207,11 @@ class TwitchRecorder:
 
     def _probe_media_duration_seconds(self, filename):
         """Get media duration in seconds using ffprobe when available."""
+        telemetry = getattr(self, '_telemetry', None)
+        if telemetry:
+            cached = telemetry.journal.media(filename)
+            if cached and cached.get('duration'):
+                return cached['duration']
         try:
             result = subprocess.run([
                 str(Path(self.ffmpeg_path).with_name('ffprobe')),
@@ -1177,6 +1226,8 @@ class TwitchRecorder:
 
             duration = float(result.stdout.strip())
             if duration > 0:
+                if telemetry:
+                    telemetry.cache_media(filename, dict(duration=duration))
                 return duration
             return None
         except Exception:
@@ -1303,6 +1354,7 @@ class TwitchRecorder:
             processed_filename = os.path.join(processed_path, filename)
             session = dict(stream_id=channel.get('id'), started_at=time.time(), ended_at=None)
             Path(recorded_filename + '.session.json').write_text(json.dumps(session))
+            self._dashboard_event('recording-started', username+' recording started', recorded_filename)
 
             logging.info(f"{Fore.GREEN}{username} online, starting recording")
 
@@ -1358,6 +1410,7 @@ class TwitchRecorder:
                 except OSError as exc:
                     logging.warning(f'Could not save recording session metadata: {exc}')
             self._release_recording_reservation(username)
+            self._dashboard_event('recording-ended', username+' recording ended', recorded_filename)
 
             # A Streamlink exit does not generate another Twitch online event.
             if getattr(self, 'eventsub_enabled', False) and not self._shutdown_event.is_set():
@@ -1433,6 +1486,22 @@ class TwitchRecorder:
                     
         except Exception as e:
             logging.error(f"Error monitoring recording: {e}")
+
+    def _start_dashboard_status(self, paths):
+        try:
+            from recorder_state import RecorderTelemetry
+            self._telemetry = RecorderTelemetry(self, Path(__file__).resolve().parent, paths)
+            self._telemetry.start()
+        except Exception as exc:
+            self._telemetry = None
+            logging.warning('Dashboard status unavailable: %s', type(exc).__name__)
+
+    def _dashboard_event(self, kind, message, path=None):
+        telemetry = getattr(self, '_telemetry', None)
+        if telemetry:
+            telemetry.event(kind, message, path)
+            telemetry.invalidate()
+
 
 def setup_logging():
     """Setup logging with proper configuration"""
