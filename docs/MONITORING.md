@@ -13,29 +13,60 @@ launchers open the same TUI; `dashboard-watch.sh 10` still sets a ten-second ref
 | View | What it shows |
 | --- | --- |
 | 1 Overview | Recorder and EventSub status, active Streamlink/FFmpeg jobs, actual output growth, recent files and events |
-| 2 Recordings | Raw, processed, stitched and failed files; searchable titles, channel and stage filters, full paths and joined parts |
+| 2 Recordings | Broadcast sessions and individual files, searchable titles, channel and stage filters, full paths and joined parts |
 | 3 Activity | Latest dated recorder log, newest entries first |
-| 4 Health | CPU, RAM, disk, temperature, uptime, systemd restarts, notification status and data sources |
+| 4 Health | CPU, RAM, disk, temperature, uptime, heartbeat age, EventSub message age, reconnect failures and active fallback |
+| 5 Queue | Active and waiting tasks, reasons, retry attempts and temporary space requirements |
+| 6 History | Persistent recorder outcomes, reconnects, failures and command results |
 
-Use **1–4** or **Tab** to change views; **Up/Down** or **j/k** to select and
+Use **1–6** or **Tab** to change views; **Up/Down** or **j/k** to select and
 scroll; **PgUp/PgDn** to move a page. In Recordings, **/** searches,
 **c** cycles channels, **g** cycles stages, **s** switches newest/largest sorting,
 and **Enter** opens file details. **Esc** closes details or clears search.
+**b** toggles broadcast sessions and individual files. In individual-file mode,
+**p** requests a path copy using terminal clipboard support, and **R** queues a
+retry for the selected quarantined file. The recorder accepts retries only from
+its configured failed folders, preserves session metadata, and refuses existing
+destination files. Requests wait while recording or background processing is
+active, expire after 24 hours, and appear in history when handled.
+**D** exports a diagnostic JSON report to `.dashboard/reports/`.
+
 **r** refreshes immediately, **Space** pauses the display, **?** shows help,
 and **q** exits.
 
-Status refreshes every two seconds. File inventories are cached for thirty
-seconds, logs are read incrementally, and service status is cached for fifteen
-seconds. This dashboard is read-only and makes no Twitch API requests. It reads
-configured recording folders, recorder processes, systemd and the latest recorder
-log; notification health is explicitly the last state reported in that log.
+Status refreshes every two seconds, and the display redraws only for new data,
+keys or terminal resizing. The recorder publishes an atomic heartbeat every five
+seconds in `/dev/shm` on the Pi; catalog scans happen every thirty seconds or after
+recording/processing transitions. The TUI uses that catalog and heartbeat when
+fresh and matching the current recorder PID. It falls back to processes, logs and
+cached scans if telemetry is missing, stale or from a previous service instance.
+This dashboard makes no Twitch API requests.
 
-Processing shows elapsed time, input/output paths, bytes written and output
-growth rather than guessing a completion percentage. Originals and stitched
-outputs appear as separate files because the recorder retains both. File dates
-show filesystem modification time, labeled Updated; displayed times default to
-America/New_York and can be changed with `dashboard_timezone` in recorder config.
-Source log timestamps retain the Pi's log timezone.
+FFmpeg progress is read continuously from its progress pipe with bounded memory.
+Percent and approximate ETA use actual media time and cached source duration;
+unknown durations show bytes written without an invented percentage. Media
+progress can reach 100% before MP4 finalization and validation finish. Working
+space estimates are conservative and show the next task's temporary output needs.
+Alerts highlight stale heartbeats, stalled output/media progress, notification
+reconnect failures, low disk/RAM and quarantined recordings.
+
+Broadcasts group by session ID, explicit stitched-part manifests, or matching
+legacy titles and measured time gaps. Grouping is for browsing; the recorder still
+checks timing and codec compatibility before stitching. Queue entries describe
+candidate work; they are not a guaranteed execution order. Originals and stitched
+outputs are retained separately and their storage is counted separately.
+
+History and media metadata are stored in `.dashboard/history.sqlite`. History
+keeps the latest 1,000 events (the TUI displays the latest 100). Media cache entries
+invalidate when a file's inode, size or modification time changes. Legacy
+processed files are probed one at a time, at least ten seconds apart, while idle.
+Warnings and errors are retained along with recording/processing outcomes; history
+begins when this telemetry version is installed. Diagnostic reports omit recorder
+credentials and redact token values in log text.
+
+Displayed times default to America/New_York and can be changed with
+`dashboard_timezone` in recorder config. File dates are filesystem modification
+times, labeled Updated. Source log timestamps retain the Pi's log timezone.
 
 For a one-time snapshot or scriptable JSON:
 
@@ -43,6 +74,7 @@ For a one-time snapshot or scriptable JSON:
 ./scripts/dashboard.sh --once
 ./scripts/dashboard.sh --json
 ./scripts/dashboard.sh --refresh 5
+./scripts/dashboard.sh --export
 ```
 
 A noninteractive invocation automatically prints a snapshot. The interactive TUI

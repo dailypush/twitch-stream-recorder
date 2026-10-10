@@ -172,3 +172,59 @@ def test_diagnostic_report_does_not_export_config_credentials(tmp_path):
     text=path.read_text()
     assert 'Bearer secret' not in text and 'access_token=private' not in text
     assert path.stat().st_mode&0o777==0o600
+
+
+def test_queue_marks_incompatible_or_distant_parts_blocked():
+    parts=[row('a',100,200,'one'),row('b',5000,5100,'one')]
+    queue=state.processing_queue(parts,state.broadcast_groups(parts),{},now=20000)
+    assert next(q for q in queue if q['kind']=='Stitch')['state']=='Blocked'
+    parts[1]['started_at']=210;parts[1]['ended_at']=300
+    for index,part in enumerate(parts):part['media']=dict(stitch_probe=dict(streams=[dict(codec_name=str(index))]))
+    queue=state.processing_queue(parts,state.broadcast_groups(parts),{},now=20000)
+    stitch=next(q for q in queue if q['kind']=='Stitch')
+    assert stitch['state']=='Blocked' and 'Incompatible' in stitch['reason']
+
+
+def test_relative_media_paths_use_the_same_cache_and_queue_identity(tmp_path,monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    journal=state.Journal(tmp_path)
+    path=Path('source.mp4');path.write_bytes(b'video')
+    journal.cache(path,dict(duration=10))
+    assert journal.media(path.resolve())['duration']==10
+    t=telemetry(tmp_path,monkeypatch);t.journal=journal
+    capture=t.progress(['ffmpeg','-i','source.mp4','out.mp4'])
+    assert capture.inputs==[str(path.resolve())] and capture.job['expected_seconds']==10
+    capture.finish(None)
+
+
+def test_history_ring_keeps_only_the_latest_events(tmp_path):
+    journal=state.Journal(tmp_path)
+    with journal.connection() as db:
+        db.executemany('INSERT INTO events(at,kind,message) VALUES(?,?,?)',[(1,'old',str(i)) for i in range(1001)])
+    journal.event('new','latest')
+    with journal.connection() as db:
+        assert db.execute('SELECT COUNT(*) FROM events').fetchone()[0]==1000
+    assert journal.recent()[0]['message']=='latest'
+
+
+def test_broadcast_view_sorts_by_stream_start_and_keeps_filtered_session_intact(tmp_path,monkeypatch):
+    c=collector(tmp_path,monkeypatch);ui=dash.Dashboard(c,2);ui.broadcasts=True
+    old=row('older.mp4',100,200);old['modified']=5000
+    newer=row('newer.mp4',1000,1200,title='newer broadcast')
+    joined=row('joined.mp4',100,200,stage='Stitched');joined['parts']=['older.mp4']
+    catalog=[old,newer,joined]
+    ui.data=dict(catalog=catalog,broadcasts=state.broadcast_groups(catalog))
+    assert ui.rows()[0]['title']==newer['title'] and ui.rows()[0]['modified']==1000
+    ui.stage='Stitched'
+    assert len(ui.rows())==1 and len(ui.rows()[0]['group']['files'])==2
+
+
+def test_retry_shortcut_requires_live_heartbeat_and_failed_file(tmp_path,monkeypatch):
+    c=collector(tmp_path,monkeypatch);ui=dash.Dashboard(c,2);ui.tab=1
+    failed=row('bad.mp4',100,200,stage='Failed')
+    ui.data=dict(catalog=[failed],status_live=False)
+    ui.key(ord('R'))
+    assert 'heartbeat' in ui.problem and not (tmp_path/'.dashboard/commands').exists()
+    ui.data['status_live']=True
+    ui.key(ord('R'))
+    assert len(list((tmp_path/'.dashboard/commands').glob('*.json')))==1

@@ -80,7 +80,7 @@ class Journal:
     def event(self, kind, message, path=None):
         with self.connection() as db:
             db.execute('INSERT INTO events(at,kind,message,path) VALUES(?,?,?,?)',
-                       (time.time(), kind, redact(message), str(path) if path else None))
+                       (time.time(), kind, redact(message), str(Path(path).resolve()) if path else None))
             db.execute('DELETE FROM events WHERE id <= (SELECT MAX(id)-1000 FROM events)')
 
     def recent(self, limit=100):
@@ -90,6 +90,7 @@ class Journal:
 
     def media(self, path):
         try:
+            path = str(Path(path).resolve())
             with self.connection() as db:
                 row = db.execute('SELECT fingerprint,data FROM media WHERE path=?', (str(path),)).fetchone()
             return json.loads(row[1]) if row and row[0] == fingerprint(path) else None
@@ -97,6 +98,7 @@ class Journal:
             return None
 
     def cache(self, path, data):
+        path = str(Path(path).resolve())
         if Path(path).name.startswith('.'):
             return  # Temporary outputs must be verified before becoming catalog entries.
         signature = fingerprint(path)
@@ -219,7 +221,7 @@ def broadcast_groups(catalog, gap=900):
         joined = any(row['stage'] == 'Stitched' for row in rows)
         raw = any(row['stage'] == 'Raw' for row in rows)
         failed = any(row['stage'] == 'Failed' for row in rows)
-        state = 'Failed' if failed else 'Recording' if any(row.get('session_open') for row in rows) else (
+        state = 'Failed' if failed else 'Open session' if any(row.get('session_open') for row in rows) else (
             'Awaiting processing' if raw else 'Stitched' if joined else 'Parts ready' if len(parts)>1 else 'Processed')
         result.append(dict(id=first.get('stream_id') or first['path'], channel=first['channel'], title=first['title'],
             started_at=first.get('started_at') or first['modified'], modified=max(row['modified'] for row in rows),
@@ -233,7 +235,7 @@ def processing_queue(catalog, groups, config, busy=False, jobs=None, now=None):
     rows = []
     def append(row, kind, reason, required=0):
         paths = row.get('inputs', [row.get('path')])
-        state = 'Running' if any(path in active for path in paths) else 'Waiting'
+        state = 'Running' if any(path in active for path in paths) else 'Blocked' if row.get('blocked') else 'Waiting'
         rows.append(dict(kind=kind, channel=row['channel'], title=row['title'], path=paths[0], inputs=paths,
                          state=state, reason='Active job' if state=='Running' else reason,
                          attempts=row.get('attempts',0), required_bytes=required))
@@ -260,13 +262,22 @@ def processing_queue(catalog, groups, config, busy=False, jobs=None, now=None):
             if complete:
                 continue
             reason = 'Recording has priority' if busy else 'Next idle stitching pass; codec compatibility will be checked'
+            blocked = False
             if any(row['stage']=='Raw' for row in group['files']):
                 reason = 'Waiting for raw parts to finish processing'
             elif any(not part.get('ended_at') for part in parts):
                 reason = 'Waiting for media metadata / closed session'
             elif now-max(part['ended_at'] for part in parts) < config.get('stitch_max_gap_seconds',900):
                 reason = 'Waiting for broadcast reconnect window to close'
-            append(dict(channel=group['channel'],title=group['title'],inputs=[part['path'] for part in parts]),
+            else:
+                ordered=sorted(parts,key=lambda part:part.get('started_at') or 0)
+                if any(part['started_at']-before['ended_at'] > config.get('stitch_max_gap_seconds',900) or
+                       part['started_at']-before['ended_at'] < -2 for before,part in zip(ordered,ordered[1:])):
+                    reason='Parts exceed the configured stitch gap or overlap';blocked=True
+                profiles=[part.get('media',{}).get('stitch_probe',{}).get('streams') for part in parts]
+                if all(profiles) and any(profile!=profiles[0] for profile in profiles):
+                    reason='Incompatible media formats; automatic stitching is blocked';blocked=True
+            append(dict(channel=group['channel'],title=group['title'],blocked=blocked,inputs=[part['path'] for part in parts]),
                    'Stitch',reason,sum(part['size'] for part in parts))
     return sorted(rows,key=lambda row: ({'Running':0}.get(row['state'],1), {'Upload':0,'Remux':1,'Move':1,'Stitch':2,'Compress':3}.get(row['kind'],4)))
 
@@ -281,7 +292,7 @@ class ProgressCapture:
         self.partial = b''
         self.values = {}
         args = list(command)
-        source = args[args.index('-i')+1] if '-i' in args else None
+        source = str(Path(args[args.index('-i')+1]).resolve()) if '-i' in args else None
         self.kind = 'Stitching' if 'concat' in args else 'Compressing' if '-crf' in args else 'Remuxing'
         self.inputs = [source] if source else []
         duration = None
@@ -296,7 +307,7 @@ class ProgressCapture:
         elif source:
             data = telemetry.journal.media(source) or {}
             duration = data.get('duration')
-        self.job = dict(kind=self.kind, inputs=self.inputs, source=source, output=args[-1],
+        self.job = dict(kind=self.kind, inputs=self.inputs, source=source, output=str(Path(args[-1]).resolve()),
                         expected_seconds=duration, media_seconds=0, percent=None, speed=None, pid=None,
                         started_at=time.time(), progress_at=time.time(), phase='Starting')
 

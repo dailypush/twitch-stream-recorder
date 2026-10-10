@@ -1,4 +1,4 @@
-"""A read-only, low-overhead curses dashboard for the Twitch recorder (Python 3.7+)."""
+"""A low-overhead recorder TUI with explicit retry and diagnostic actions (Python 3.7+)."""
 import argparse
 import base64
 import sqlite3
@@ -337,6 +337,9 @@ class Collector:
             if notifications.get('connected') and notifications.get('last_message_at') and now-notifications['last_message_at'] > notifications.get('keepalive_seconds',30)+5:
                 state = 'Stale connection'
         groups = broadcast_groups(self.catalog,self.config.get('stitch_max_gap_seconds',900))
+        for group in groups:
+            if any(row['path'] in {path for job in jobs if job['kind']=='Recording' for path in job['inputs']+[job['output']]} for row in group['files']):
+                group['state']='Recording'
         queue = self.status.get('queue',[]) if self.status_live else processing_queue(self.catalog,groups,self.config,bool([job for job in jobs if job['kind']=='Recording']),jobs,now)
         counts = collections.Counter(row['stage'] for row in self.catalog)
         alerts = list(self.catalog_errors)
@@ -346,8 +349,11 @@ class Collector:
             alerts.append('EventSub %s; status polling is the fallback' % state.lower())
         if records and self.status and not self.status_live:
             alerts.append('Recorder heartbeat is stale (%s); showing process/log fallback' % elapsed(age))
-        if notifications.get('failure_count',0):
-            alerts.append('EventSub reconnect failures this recorder session: %s' % notifications['failure_count'])
+        recent_failures=sum(event.get('kind')=='warning' and 'EventSub unavailable' in event.get('message','') and
+                            event.get('at',0)>=now-900 for event in self.history)
+        notifications['recent_failure_count']=recent_failures
+        if recent_failures>=3:
+            alerts.append('Repeated EventSub failures in the last 15 minutes: %s' % recent_failures)
         for job in jobs:
             if job.get('no_growth',0)>=self.config.get('recording_stall_timeout_seconds',300) and (
                     job.get('phase')!='Finalizing / validating' and now-job.get('progress_at',now-job.get('no_growth',0))>=300):
@@ -408,6 +414,7 @@ class Dashboard:
         self.selected_path = None
         self.problem = None
         self.broadcasts = False
+        self.report_path = None
 
     def rows(self):
         result = [row for row in self.data.get('catalog', []) if
@@ -415,9 +422,13 @@ class Dashboard:
                   (self.stage == 'All' or row['stage'] == self.stage) and
                   self.query.lower() in (row['name']+' '+row['channel']).lower()]
         if self.broadcasts:
-            groups=broadcast_groups(result,self.collector.config.get('stitch_max_gap_seconds',900))
+            paths={row['path'] for row in result}
+            groups=self.data.get('broadcasts')
+            if groups is None:
+                groups=broadcast_groups(result,self.collector.config.get('stitch_max_gap_seconds',900))
+            groups=[group for group in groups if any(row['path'] in paths for row in group['files'])]
             result=[dict(path=group['id'],name=group['title'],title=group['title'],channel=group['channel'],
-                stage=group['state'],size=group['size'],modified=group['modified'],group=group) for group in groups]
+                stage=group['state'],size=group['size'],modified=group['started_at'],group=group) for group in groups]
         return sorted(result, key=lambda row: row['size'] if self.sort == 'largest' else row['modified'], reverse=True)
 
     def text(self, screen, y, x, value, attr=0):
@@ -505,22 +516,27 @@ class Dashboard:
                         'Compressed: '+str(row['compressed']),'Upload pending: '+str(row['upload_pending']), '', 'Full path:',row['path']]
                     if row.get('parts'):
                         details += ['', 'JOINED PARTS']+row['parts']
-                    events=[event for event in d.get('history',[]) if event.get('path')==row['path']]
+                    if row.get('failure'):
+                        details += ['', 'LAST PROCESSING FAILURE',str(row['failure'].get('reason','unknown'))]
+                    events=[event for event in d.get('history',[]) if event.get('path')==row['path'] or
+                            row['name'] in event.get('message','')]
                     if events:
                         details += ['', 'FILE HISTORY']+[display_time(e['at'],d['timezone'])+' '+e['kind']+': '+e['message'] for e in events]
                 self.draw_lines(screen,details,7,h-3)
             else:
-                self.text(screen,7,1,'STAGE      CHANNEL         SIZE        UPDATED           TITLE' if w >= 100 else
+                self.text(screen,7,1,('STATE      CHANNEL         SIZE        STARTED           TITLE' if self.broadcasts else
+                          'STAGE      CHANNEL         SIZE        UPDATED           TITLE') if w >= 100 else
                           'STAGE      CHANNEL      SIZE       TITLE',curses.A_BOLD)
                 visible = max(1,h-11)
                 start = max(0,self.selection-visible+1)
                 for offset,row in enumerate(rows[start:start+visible]):
                     selected = start+offset == self.selection
+                    title=('[%s parts] '%row['group']['part_count'] if row.get('group') and row['group']['part_count']>1 else '')+row['title']
                     if w >= 100:
                         line = '%-10s %-15s %-11s %-17s %s' % (row['stage'][:10],row['channel'][:14],human_bytes(row['size']),
-                            display_time(row['modified'],d['timezone'])[:16],row['title'])
+                            display_time(row['modified'],d['timezone'])[:16],title)
                     else:
-                        line = '%-10s %-12s %-10s %s' % (row['stage'][:10],row['channel'][:12],human_bytes(row['size']),row['title'])
+                        line = '%-10s %-12s %-10s %s' % (row['stage'][:10],row['channel'][:12],human_bytes(row['size']),title)
                     self.text(screen,8+offset,1,line,curses.A_REVERSE if selected else 0)
                 if not rows:
                     self.text(screen,9,1,'No files match these filters.')
@@ -541,6 +557,7 @@ class Dashboard:
                 'EventSub last received message: '+display_time(d.get('notifications',{}).get('last_message_at'),d['timezone']),
                 'EventSub last stream event: '+display_time(d.get('notifications',{}).get('last_event_at'),d['timezone']),
                 'EventSub reconnect failures: '+str(d.get('notifications',{}).get('failure_count','--')),
+                'EventSub failures in last 15 minutes: '+str(d.get('notifications',{}).get('recent_failure_count','--')),
                 'Fallback polling active: '+('Yes' if d.get('fallback_active') else 'No' if d.get('fallback_active') is False else 'Unknown'),
                 'Targeted recovery checks: '+(', '.join(d.get('recovery_users',[])) or 'none'),
                 'EventSub report timestamp (source log zone): '+str(d['eventsub_reported'] or '--'),
@@ -563,6 +580,8 @@ class Dashboard:
             self.draw_lines(screen,lines if d.get('queue') or d.get('commands') else lines+['Queue empty'],4,h-3)
         elif self.tab == 5:
             lines=['PERSISTENT HISTORY (newest first)','','D: export a diagnostic report','']
+            if self.report_path:
+                lines += ['LATEST DIAGNOSTIC REPORT',str(self.report_path),'']
             for event in d.get('history',[]):
                 lines += [display_time(event['at'],d['timezone'])+'  '+event['kind'].upper(),event['message'],'']
             if not d.get('history'):
@@ -654,7 +673,8 @@ class Dashboard:
         elif key==ord('D'):
             try:
                 path=export_report(self.collector.base,self.data)
-                self.problem='Report saved: '+str(path)
+                self.report_path=path;self.tab=5;self.scroll=0
+                self.problem='Report saved; full path shown in History (6)'
             except OSError as exc:
                 self.problem='Report export failed: '+str(exc)
         elif key==ord('s'):

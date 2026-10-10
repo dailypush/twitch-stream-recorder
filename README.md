@@ -108,7 +108,7 @@ python twitch_recorder.py -l DEBUG
 
 ## Monitoring Dashboard
 
-Use the consolidated TUI for recording history, live processing, logs and system health:
+Use the consolidated TUI for broadcast history, live processing, queue, logs and system health:
 
 ```bash
 ./scripts/dashboard.sh
@@ -118,10 +118,13 @@ dashboard
 ./scripts/dashboard.sh --once
 ```
 
-Switch views with **1–4** or **Tab**. Search files with **/**, filter by channel
+Switch views with **1–6** or **Tab**. Search files with **/**, filter by channel
 with **c** or stage with **g**, and open details with **Enter**. Press **?** for
 shortcuts and **q** to exit. The former live and watch scripts launch the same TUI.
-It makes no Twitch API calls and caches file scans to limit Pi disk activity.
+Use **b** for broadcasts/files, **R** to queue a quarantined-file retry, and **D**
+to export diagnostics. Recorder heartbeats, measured FFmpeg progress and persistent
+history improve status accuracy. It makes no Twitch API calls and caches file scans
+to limit Pi disk activity.
 
 See [docs/MONITORING.md](docs/MONITORING.md) for details.
 
