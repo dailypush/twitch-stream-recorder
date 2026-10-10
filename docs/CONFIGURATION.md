@@ -7,6 +7,8 @@ Set these options in `config/config.json`:
 | Option | Default | Behavior |
 |--------|---------|----------|
 | `processing_threads` | `1` | FFmpeg decoder/encoder thread limit for idle compression; minimum 1. |
+| `stitch_recordings_enabled` | `true` | Automatically create joined copies of compatible recording parts during idle processing. Requires FFmpeg. |
+| `stitch_max_gap_seconds` | `900` | Maximum gap between recording parts, and idle wait after the last part before stitching. |
 | `recording_stall_timeout_seconds` | `300` | Stop a recording with no file growth for this long, including a missing output file; minimum 30 seconds. The next online check can start a fresh recording. Allow enough time for ad breaks and network interruptions. |
 | `retention_check_interval_seconds` | `3600` | Check retention at startup and periodically while running; minimum 60 seconds. Checks defer while background processing is active. |
 | `prune_after_days` | `30` | Delete recordings older than this many whole days; zero or negative disables retention. Active channels' raw recordings and files awaiting upload are protected. |
@@ -19,6 +21,25 @@ no longer used. Compression runs at reduced process priority on POSIX systems.
 Background FFmpeg stops on recording activity or shutdown and restarts its work
 from the beginning on a later idle cycle. Interruptions do not consume the remux
 failure retry budget.
+
+Automatic stitching runs after a channel's raw processing queue is empty. New
+recordings carry `.session.json` metadata with Twitch's broadcast ID and recording
+start/end times. Parts must share that ID, even if the title changes. Different
+broadcast IDs stay separate. Older files without metadata use matching channel
+and title plus filename timestamps and media duration; this fallback cannot
+prove broadcast identity. Mixing metadata and legacy parts is avoided. Overlapping
+parts and gaps longer than the configured limit stay separate.
+
+Joined videos appear in `processed/<username>/stitched/` with a ` - stitched.mp4`
+suffix. Original parts remain available. A `.parts.json` manifest prevents
+repeated joins and lets a later part trigger a replacement joined copy. Formats
+(including resolution and codec parameters) must match; incompatible parts are
+left separate and logged. Stitching copies encoded media without re-encoding,
+validates the combined duration, and publishes atomically. Missing footage is
+omitted rather than replaced with blank video. Recent parts wait out the reconnect
+window before compression. Joined files participate in retention and network
+upload retries, but are not separately compressed. Existing batch shell processing
+does not stitch; this feature runs in the Python recorder's idle processing.
 
 FFmpeg processing requires `ffprobe` alongside the configured `ffmpeg` executable
 (or both on `PATH` when using the default names). Remux and compression outputs

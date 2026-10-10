@@ -9,6 +9,8 @@
     "prune_after_days": 7,
     "max_processing_attempts": 3,
     "processing_threads": 1,
+    "stitch_recordings_enabled": true,
+    "stitch_max_gap_seconds": 900,
     "recording_stall_timeout_seconds": 300,
     "retention_check_interval_seconds": 3600,
     "upload_to_network_drive": false,

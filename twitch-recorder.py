@@ -14,6 +14,8 @@ import json
 import threading
 import signal
 import tempfile
+import re
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from tqdm import tqdm
 from pathlib import Path
@@ -58,6 +60,8 @@ class TwitchRecorder:
         self.idle_compress_preset = config_data.get("idle_compress_preset", "medium")
         self.idle_compress_audio_bitrate = config_data.get("idle_compress_audio_bitrate", "128k")
         self.processing_threads = max(1, config_data.get("processing_threads", 1))
+        self.stitch_recordings_enabled = config_data.get("stitch_recordings_enabled", True)
+        self.stitch_max_gap_seconds = max(0, config_data.get("stitch_max_gap_seconds", 900))
         self.recording_stall_timeout = max(30, config_data.get("recording_stall_timeout_seconds", 300))
         self.retention_check_interval = max(60, config_data.get("retention_check_interval_seconds", 3600))
         self._next_prune_at = 0
@@ -343,12 +347,22 @@ class TwitchRecorder:
                 if self._shutdown_event.is_set() or self.active_recordings > 0:
                     return
                 self._retry_pending_uploads(paths[username][1])
+                stitched_path = Path(paths[username][1]) / 'stitched'
+                if stitched_path.exists():
+                    self._retry_pending_uploads(str(stitched_path))
 
             for username in self.usernames:
                 if self._shutdown_event.is_set() or self.active_recordings > 0:
                     return
                 recorded_path, processed_path = paths[username]
                 self.process_previous_recordings(recorded_path, processed_path)
+
+            if not self.disable_ffmpeg and getattr(self, 'stitch_recordings_enabled', True):
+                for username in self.usernames:
+                    self._check_processing_idle()
+                    recorded_path, processed_path = paths[username]
+                    if not list(Path(recorded_path).glob('*.mp4')):
+                        self.stitch_processed_recordings(processed_path)
 
             if self.disable_ffmpeg or not self.idle_compress_enabled:
                 return
@@ -358,6 +372,8 @@ class TwitchRecorder:
                     return
                 _, processed_path = paths[username]
                 self.compress_processed_file(processed_path)
+        except ProcessingInterrupted:
+            logging.info('Idle processing postponed for recording or shutdown')
         except Exception as e:
             logging.error(f"Idle processing error: {e}")
 
@@ -567,6 +583,7 @@ class TwitchRecorder:
                 if not self._is_user_recording(username):
                     self.prune_old_files(recorded_path)
                 self.prune_old_files(processed_path)
+                self.prune_old_files(os.path.join(processed_path, 'stitched'))
         self._next_prune_at = now + self.retention_check_interval
 
     def prune_old_files(self, path):
@@ -583,7 +600,7 @@ class TwitchRecorder:
                     if age_in_days > self.prune_after_days:
                         try:
                             filepath.unlink()
-                            for suffix in ('.compressed', '.attempts'):
+                            for suffix in ('.compressed', '.attempts', '.session.json', '.parts.json'):
                                 sidecar = Path(str(filepath) + suffix)
                                 if sidecar.exists():
                                     sidecar.unlink()
@@ -643,6 +660,7 @@ class TwitchRecorder:
                     Path(processed_filename + '.upload-pending').touch()
                 logging.info(f"Moving: {recorded_filename}")
                 self._move_recording(recorded_filename, processed_filename)
+                self._transfer_recording_metadata(recorded_filename, processed_filename)
                 self._clear_processing_attempts(recorded_filename)
             else:
                 # Double check we're still idle before starting ffmpeg
@@ -652,6 +670,7 @@ class TwitchRecorder:
                     
                 logging.info(f"Processing with ffmpeg: {recorded_filename}")
                 if self.ffmpeg_copy_and_fix_errors(recorded_filename, processed_filename):
+                    self._transfer_recording_metadata(recorded_filename, processed_filename)
                     self._clear_processing_attempts(recorded_filename)
                     try:
                         os.remove(recorded_filename)
@@ -672,6 +691,127 @@ class TwitchRecorder:
             logging.error(f"Error processing file {recorded_filename}: {e}")
             if os.path.exists(recorded_filename):
                 self._record_processing_failure(recorded_filename)
+
+    def _transfer_recording_metadata(self, source, destination):
+        metadata = Path(str(source) + '.session.json')
+        if metadata.exists():
+            shutil.copyfile(str(metadata), str(destination) + '.session.json')
+            metadata.unlink()
+
+    def _stitch_part(self, path):
+        """Read broadcast identity and media format; fall back conservatively for old files."""
+        match = re.fullmatch(r'(.+?) - (\d{4}-\d{2}-\d{2} \d{2}h\d{2}m\d{2}s) - (.+)\.mp4', path.name)
+        if not match:
+            return None
+        result = subprocess.run([
+            str(Path(self.ffmpeg_path).with_name('ffprobe')), '-v', 'error',
+            '-show_streams', '-show_format', '-show_data_hash', 'sha256',
+            '-of', 'json', str(path)
+        ], capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            return None
+        probe = json.loads(result.stdout)
+        duration = float(probe['format']['duration'])
+        if not math.isfinite(duration) or duration <= 0:
+            return None
+        fields = ('codec_type', 'codec_name', 'width', 'height', 'pix_fmt',
+                  'sample_rate', 'channels', 'time_base', 'extradata_hash')
+        profile = [tuple(stream.get(key) for key in fields) for stream in probe['streams']]
+        if not profile or not any(s[0] == 'video' for s in profile):
+            return None
+        start = datetime.datetime.strptime(match[2], '%Y-%m-%d %Hh%Mm%Ss').timestamp()
+        end = start + duration
+        stream_id = None
+        metadata_path = Path(str(path) + '.session.json')
+        if metadata_path.exists():
+            metadata = json.loads(metadata_path.read_text())
+            # An unfinished recording must never enter a joined output.
+            if not metadata.get('ended_at'):
+                return None
+            start, end = float(metadata['started_at']), float(metadata['ended_at'])
+            stream_id = metadata.get('stream_id')
+        return dict(path=path, start=start, end=end, duration=duration,
+                    stream_id=stream_id, title=match[3], user=match[1], profile=profile)
+
+    def stitch_processed_recordings(self, processed_path):
+        """Publish verified joined copies, keeping all original parts for recovery."""
+        parts = []
+        for path in sorted(Path(processed_path).glob('*.mp4')):
+            self._check_processing_idle()
+            try:
+                part = self._stitch_part(path)
+                if part:
+                    parts.append(part)
+            except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
+                logging.warning(f'Skipping stitching candidate {path}: {exc}')
+        parts.sort(key=lambda part: part['start'])
+        groups = []
+        max_gap = getattr(self, 'stitch_max_gap_seconds', 900)
+        for part in parts:
+            previous = groups[-1][-1] if groups else None
+            same_session = False
+            if previous and previous['user'] == part['user']:
+                if previous['stream_id'] and part['stream_id']:
+                    same_session = previous['stream_id'] == part['stream_id']
+                elif not previous['stream_id'] and not part['stream_id']:
+                    same_session = previous['title'] == part['title']
+                gap = part['start'] - previous['end']
+                same_session = same_session and -2 <= gap <= max_gap
+            if same_session:
+                groups[-1].append(part)
+            else:
+                groups.append([part])
+        for group in groups:
+            self._check_processing_idle()
+            if len(group) < 2 or time.time() - group[-1]['end'] < max_gap:
+                continue
+            if any(part['profile'] != group[0]['profile'] for part in group):
+                logging.warning(f'Cannot stitch incompatible media formats: {group[0]["path"]}')
+                continue
+            output_dir = Path(processed_path) / 'stitched'
+            output_dir.mkdir(exist_ok=True)
+            destination = output_dir / (group[0]['path'].stem + ' - stitched.mp4')
+            manifest_path = Path(str(destination) + '.parts.json')
+            names = [part['path'].name for part in group]
+            if destination.exists() and manifest_path.exists():
+                try:
+                    if json.loads(manifest_path.read_text()) == names:
+                        continue
+                except ValueError:
+                    pass
+            temp_output = self._temporary_output(str(destination))
+            try:
+                with tempfile.TemporaryDirectory(prefix='twitch-stitch-') as workdir:
+                    # Safe simple aliases avoid concat quoting issues with titles/paths.
+                    entries = []
+                    for index, part in enumerate(group):
+                        alias = Path(workdir) / f'part-{index}.mp4'
+                        alias.symlink_to(part['path'].resolve())
+                        entries.append(f"file '{alias}'\n")
+                        entries.append(f"duration {part['duration']}\n")
+                    concat = Path(workdir) / 'parts.txt'
+                    concat.write_text(''.join(entries))
+                    expected = sum(part['duration'] for part in group)
+                    result = self._run_background_ffmpeg([
+                        self.ffmpeg_path, '-nostdin', '-nostats', '-loglevel', 'warning',
+                        '-f', 'concat', '-safe', '0', '-i', str(concat),
+                        '-map', '0', '-c', 'copy', '-movflags', '+faststart', '-y', temp_output
+                    ], max(5400, int(expected * 2.5) + 900))
+                    actual = self._probe_media_duration_seconds(temp_output)
+                    if result.returncode or not actual or abs(actual - expected) > max(2, expected * .02):
+                        logging.error(f'Stitch failed validation for {destination}: {result.stderr}')
+                        continue
+                    self._check_processing_idle()
+                    if self.upload_to_network_drive_enabled:
+                        Path(str(destination) + '.upload-pending').touch()
+                    os.replace(temp_output, destination)
+                    manifest_path.write_text(json.dumps(names, indent=2))
+                    logging.info(f'Stitched {len(group)} recording parts into {destination}')
+                    if self.upload_to_network_drive_enabled:
+                        self.upload_to_network_drive(str(destination))
+            finally:
+                if os.path.exists(temp_output):
+                    os.remove(temp_output)
 
     def _processing_attempts_file(self, recorded_filename):
         return f"{recorded_filename}.attempts"
@@ -881,6 +1021,21 @@ class TwitchRecorder:
             
             if not video_files:
                 return
+
+            # Leave recent parts untouched until the stitching reconnect window closes.
+            if getattr(self, 'stitch_recordings_enabled', True):
+                eligible = []
+                for filename in video_files:
+                    path = Path(processed_path) / filename
+                    try:
+                        part = self._stitch_part(path)
+                    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
+                        part = None
+                    if not part or time.time() - part['end'] >= getattr(self, 'stitch_max_gap_seconds', 900):
+                        eligible.append(filename)
+                video_files = eligible
+                if not video_files:
+                    return
             
             filename = video_files[0]
             source = os.path.join(processed_path, filename)
@@ -1078,6 +1233,8 @@ class TwitchRecorder:
     def record_stream(self, username, info, recorded_path, processed_path):
         """Record a stream with proper process management"""
         streamlink_process = None
+        recorded_filename = None
+        session = None
         try:
             channel = info["data"][0]
             timestamp = datetime.datetime.now().strftime('%Y-%m-%d %Hh%Mm%Ss')
@@ -1091,6 +1248,8 @@ class TwitchRecorder:
             
             recorded_filename = os.path.join(recorded_path, filename)
             processed_filename = os.path.join(processed_path, filename)
+            session = dict(stream_id=channel.get('id'), started_at=time.time(), ended_at=None)
+            Path(recorded_filename + '.session.json').write_text(json.dumps(session))
 
             logging.info(f"{Fore.GREEN}{username} online, starting recording")
 
@@ -1139,6 +1298,12 @@ class TwitchRecorder:
         except Exception as e:
             logging.error(f"Error recording {username}: {e}")
         finally:
+            if session and recorded_filename:
+                try:
+                    session['ended_at'] = time.time()
+                    Path(recorded_filename + '.session.json').write_text(json.dumps(session))
+                except OSError as exc:
+                    logging.warning(f'Could not save recording session metadata: {exc}')
             self._release_recording_reservation(username)
 
     def _monitor_recording(self, process, filename, display_name):
