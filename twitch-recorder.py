@@ -94,6 +94,8 @@ class TwitchRecorder:
         self._idle_processing_thread = None
         self._idle_processing_lock = threading.Lock()
         self._processing_active = threading.Event()
+        self._processing_yield = threading.Event()
+        self._recording_admission_lock = threading.Lock()
         self._shutdown_event = threading.Event()
         self._executor = None  # Store executor reference for cleanup
         self._token_refresh_lock = threading.Lock()  # Lock for token refresh
@@ -391,6 +393,22 @@ class TwitchRecorder:
         
         cpu_usage = psutil.cpu_percent(interval=1)
         memory_usage = psutil.virtual_memory().percent
+
+        if memory_usage > self.memory_threshold and self._processing_active.is_set():
+            logging.info('Stopping background FFmpeg to free memory for live recording')
+            # The admission lock owner keeps this set until a recording reserves
+            # its slot, so no replacement encoder can race the resource check.
+            self._processing_yield.set()
+            deadline = time.monotonic() + 10
+            while self._processing_active.is_set():
+                if self._shutdown_event.wait(0.05) or time.monotonic() >= deadline:
+                    logging.warning('Background FFmpeg did not yield before recording admission timeout')
+                    return False
+            cpu_usage = psutil.cpu_percent(interval=1)
+            memory_usage = psutil.virtual_memory().percent
+
+        if self._shutdown_event.is_set():
+            return False
         
         # Background FFmpeg yields as soon as a recording reserves a slot.
         if (cpu_usage > self.cpu_threshold and not self._processing_active.is_set()) or memory_usage > self.memory_threshold:
@@ -566,10 +584,14 @@ class TwitchRecorder:
                         f"{Fore.YELLOW}{username} already has an active recording process; skipping duplicate start"
                     )
                     return status
-                if self.can_start_new_recording():
-                    self._start_recording_thread(username, info, recorded_path, processed_path)
-                else:
-                    logging.info(f"{Fore.YELLOW}Cannot start recording for {username} - resource limits")
+                with self._recording_admission_lock:
+                    try:
+                        if self.can_start_new_recording():
+                            self._start_recording_thread(username, info, recorded_path, processed_path)
+                        else:
+                            logging.info(f"{Fore.YELLOW}Cannot start recording for {username} - resource limits")
+                    finally:
+                        self._processing_yield.clear()
             return status
         except Exception as e:
             logging.error(f"Error checking {username}: {e}")
@@ -951,7 +973,7 @@ class TwitchRecorder:
                 logging.error(f"Failed to quarantine recording {recorded_filename}: {e}")
 
     def _check_processing_idle(self):
-        if self._shutdown_event.is_set() or self.active_recordings > 0:
+        if self._shutdown_event.is_set() or self._processing_yield.is_set() or self.active_recordings > 0:
             raise ProcessingInterrupted()
 
     def _move_recording(self, source, destination):
@@ -998,8 +1020,10 @@ class TwitchRecorder:
 
     def _wait_for_compression_idle(self):
         while self._background_pause_reason() and not self._shutdown_event.is_set():
+            if self._processing_yield.is_set():
+                raise ProcessingInterrupted()
             self._shutdown_event.wait(0.5)
-        if self._shutdown_event.is_set():
+        if self._shutdown_event.is_set() or self._processing_yield.is_set():
             raise ProcessingInterrupted()
 
     def _process_before_compression_resume(self):
@@ -1033,6 +1057,7 @@ class TwitchRecorder:
         suspended = False
         control = None
         try:
+            self._check_processing_idle()
             # Keep verbose FFmpeg output off the heap for multi-hour recordings.
             with tempfile.TemporaryFile(mode='w+b') as stderr:
                 if telemetry:
@@ -1057,9 +1082,12 @@ class TwitchRecorder:
                     while process.poll() is None:
                         if capture:
                             capture.sample()
-                        if self._shutdown_event.is_set():
+                        if self._shutdown_event.is_set() or self._processing_yield.is_set():
                             raise ProcessingInterrupted()
                         if pause_for_recordings:
+                            if self.active_recordings and psutil.virtual_memory().percent > self.memory_threshold:
+                                logging.info('Stopping compression to release memory for active recording')
+                                raise ProcessingInterrupted()
                             pause_reason = self._background_pause_reason()
                             if pause_reason:
                                 if not suspended:

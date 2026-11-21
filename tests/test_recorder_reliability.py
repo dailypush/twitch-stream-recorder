@@ -329,7 +329,7 @@ def test_high_cpu_does_not_disable_polling(monkeypatch):
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize('processing,memory,expected', [(False, 20, False), (True, 20, True), (True, 95, False)])
+@pytest.mark.parametrize('processing,memory,expected', [(False, 20, False), (True, 20, True), (False, 95, False)])
 def test_background_cpu_yields_but_memory_limit_remains(monkeypatch, processing, memory, expected):
     recorder = make_recorder()
     recorder.cpu_threshold = 80
@@ -341,6 +341,56 @@ def test_background_cpu_yields_but_memory_limit_remains(monkeypatch, processing,
     monkeypatch.setattr(module.psutil, 'virtual_memory', lambda: SimpleNamespace(percent=memory))
     monkeypatch.setattr(module.psutil, 'disk_usage', lambda path: SimpleNamespace(free=2 * 1024**3))
     assert recorder.can_start_new_recording() == expected
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'shutdown', 'start_error'])
+def test_recording_admission_releases_yield_on_failure(monkeypatch, failure):
+    recorder = make_recorder()
+    recorder.root_path = '.'
+    monkeypatch.setattr(recorder, 'check_user', lambda user: (module.TwitchResponseStatus.ONLINE, {}))
+    monkeypatch.setattr(module.psutil, 'cpu_percent', lambda **kwargs: 10)
+    monkeypatch.setattr(module.psutil, 'virtual_memory', lambda: SimpleNamespace(percent=95))
+    recorder._processing_active.set()
+    if failure == 'start_error':
+        def allow():
+            recorder._processing_yield.set()
+            return True
+        monkeypatch.setattr(recorder, 'can_start_new_recording', allow)
+    else:
+        ticks = iter([0, 11])
+        monkeypatch.setattr(module.time, 'monotonic', lambda: next(ticks))
+        def wait(timeout):
+            if failure == 'shutdown':
+                recorder._shutdown_event.set()
+                return True
+            return False
+        monkeypatch.setattr(recorder._shutdown_event, 'wait', wait)
+    start = Mock(side_effect=RuntimeError('thread failed'))
+    monkeypatch.setattr(recorder, '_start_recording_thread', start)
+    recorder.check_and_record_user('alice', 'recorded', 'processed')
+    assert start.call_count == (1 if failure == 'start_error' else 0)
+    assert not recorder._processing_yield.is_set()
+    assert recorder._recording_admission_lock.acquire(blocking=False)
+    recorder._recording_admission_lock.release()
+
+
+def test_preempted_compression_preserves_original_and_removes_partial(monkeypatch, tmp_path):
+    recorder = make_recorder()
+    recorder.ffmpeg_path = 'ffmpeg'
+    recorder.idle_compress_crf = 28
+    recorder.idle_compress_preset = 'medium'
+    recorder.idle_compress_audio_bitrate = '128k'
+    recorder.stitch_recordings_enabled = False
+    source = tmp_path / 'recording.mp4'
+    source.write_bytes(b'complete original recording')
+    monkeypatch.setattr(recorder, '_probe_media_duration_seconds', lambda name: 100)
+    def interrupt(command, *args, **kwargs):
+        Path(command[-1]).write_bytes(b'partial encode')
+        raise module.ProcessingInterrupted()
+    monkeypatch.setattr(recorder, '_run_background_ffmpeg', interrupt)
+    recorder.compress_processed_file(str(tmp_path))
+    assert source.read_bytes() == b'complete original recording'
+    assert list(tmp_path.iterdir()) == [source]
 
 
 @pytest.mark.skipif(not shutil.which('ffmpeg') or not shutil.which('ffprobe'), reason='FFmpeg tools required')

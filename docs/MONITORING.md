@@ -64,6 +64,13 @@ stitched before that same encoder resumes. The Overview phase and Queue show
 paused compression; expected pauses do not raise stalled-output alerts. ETA uses
 active encoding time, excluding recording pauses.
 
+Recording takes priority over retained compression progress when memory is
+scarce. If background FFmpeg blocks a live recording at the configured memory
+limit, the recorder stops and reaps it, then rechecks resources before starting
+the recording. A paused encoder is also stopped if memory becomes scarce during
+a recording. The original video stays intact; the partial compressed output is
+discarded and compression retries during a later idle period.
+
 Compression has no fixed total runtime limit: it can use idle periods lasting
 days. `idle_compress_stall_timeout_seconds` defaults to 1800 (30 minutes) and
 stops an encoder only when frames, media time and output bytes all stop advancing

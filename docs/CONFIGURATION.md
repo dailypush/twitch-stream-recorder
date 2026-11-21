@@ -61,9 +61,18 @@ Online checks continue under high CPU load. `cpu_threshold` and `memory_threshol
 still govern new recordings; CPU consumed by background FFmpeg does not block a
 new recording, because background FFmpeg yields to it. `check_cpu_threshold` is
 no longer used. Compression runs at reduced process priority on POSIX systems.
-Background FFmpeg stops on recording activity or shutdown and restarts its work
-from the beginning on a later idle cycle. Interruptions do not consume the remux
-failure retry budget.
+When background FFmpeg makes memory exceed `memory_threshold`, a live recording
+request stops and reaps that process before rechecking CPU, memory, and disk
+limits. New background encoders are blocked until that recording has reserved
+its slot or admission has failed. If memory remains high, recording still waits
+for resources; the limit is not bypassed.
+
+With sufficient memory, idle compression pauses and retains progress during
+recordings. If memory rises above the threshold while recording, even a paused
+encoder is stopped to release its memory. Its original video is preserved and
+the partial compressed output is removed; compression retries from the beginning
+on a later idle cycle. Remuxing and stitching stop on recording activity or
+shutdown. Interruptions do not consume the remux failure retry budget.
 
 Automatic stitching runs after a channel's raw processing queue is empty. New
 recordings carry `.session.json` metadata with Twitch's broadcast ID and recording

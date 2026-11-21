@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import psutil
 import pytest
@@ -59,6 +60,7 @@ def start_worker(monkeypatch, recorder, command):
 @pytest.mark.parametrize('shutdown', [False, True])
 def test_encoder_retains_progress_while_recording_and_is_reaped(monkeypatch, tmp_path, shutdown):
     recorder = make_recorder()
+    monkeypatch.setattr(module.psutil, 'virtual_memory', lambda: SimpleNamespace(percent=20))
     recorder.idle_compress_stall_timeout = .75
     command = encoder(tmp_path)
     worker, child, results, errors = start_worker(monkeypatch, recorder, command)
@@ -107,6 +109,61 @@ def test_encoder_without_progress_times_out_and_is_reaped(monkeypatch, tmp_path)
         assert isinstance(errors[0], subprocess.TimeoutExpired)
     finally:
         recorder._shutdown_event.set(); worker.join(6)
+        if child.poll() is None:
+            child.kill(); child.wait()
+
+
+@pytest.mark.parametrize('memory_after,expected', [(20, True), (95, False)])
+def test_live_recording_reclaims_encoder_memory_before_admission(monkeypatch, tmp_path, memory_after, expected):
+    recorder = make_recorder()
+    recorder.root_path = str(tmp_path)
+    worker, child, results, errors = start_worker(monkeypatch, recorder, encoder(tmp_path))
+    monkeypatch.setattr(module.psutil, 'cpu_percent', lambda **kwargs: 10)
+    monkeypatch.setattr(module.psutil, 'virtual_memory',
+                        lambda: SimpleNamespace(percent=95 if child.poll() is None else memory_after))
+    monkeypatch.setattr(module.psutil, 'disk_usage', lambda path: SimpleNamespace(free=2 * 1024**3))
+    monkeypatch.setattr(recorder, 'check_user', lambda user: (module.TwitchResponseStatus.ONLINE, {}))
+    starts = []
+    def start(username, *args):
+        assert child.poll() is not None  # RAM is released before reserving a slot.
+        assert recorder._processing_yield.is_set()
+        with pytest.raises(module.ProcessingInterrupted):
+            recorder._check_processing_idle()  # A replacement encoder cannot start.
+        starts.append(username)
+        return recorder._reserve_recording(username)[0]
+    monkeypatch.setattr(recorder, '_start_recording_thread', start)
+    try:
+        recorder.check_and_record_user('alice', 'recorded', 'processed')
+        worker.join(3)
+        assert not worker.is_alive() and child.poll() is not None
+        assert not results and len(errors) == 1
+        assert isinstance(errors[0], module.ProcessingInterrupted)
+        assert starts == (['alice'] if expected else [])
+        assert not recorder._processing_yield.is_set()
+    finally:
+        recorder._shutdown_event.set()
+        worker.join(6)
+        if child.poll() is None:
+            child.kill(); child.wait()
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='Verifies OS process suspension')
+def test_suspended_encoder_is_reaped_if_recording_memory_rises(monkeypatch, tmp_path):
+    recorder = make_recorder()
+    memory = SimpleNamespace(percent=20)
+    monkeypatch.setattr(module.psutil, 'virtual_memory', lambda: memory)
+    worker, child, results, errors = start_worker(monkeypatch, recorder, encoder(tmp_path))
+    try:
+        recorder._reserve_recording('alice')
+        wait_until(lambda: psutil.Process(child.pid).status() == psutil.STATUS_STOPPED)
+        memory.percent = 95
+        worker.join(3)
+        assert not worker.is_alive() and child.poll() is not None
+        assert not results and len(errors) == 1
+        assert isinstance(errors[0], module.ProcessingInterrupted)
+    finally:
+        recorder._shutdown_event.set()
+        worker.join(6)
         if child.poll() is None:
             child.kill(); child.wait()
 
